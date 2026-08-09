@@ -1,0 +1,2011 @@
+#!/usr/bin/env python3
+"""EMEET PIXY webcam control for the Omarchy shell.
+
+One-shot CLI. Every subcommand prints a single JSON object on stdout and
+exits 0 — including on failure, where it prints {"ok": false, "error": ...}.
+The panel is a UI, not an error handler: it should never have to distinguish
+"the helper crashed" from "the camera is unplugged", so both arrive as data.
+
+Subcommands:
+  state                 read the camera: mode, PTZ, zoom, presets, stream use
+  mode                  set the control mode (standard/tracking/privacy)
+  ptz                   pan/tilt: --pan/--tilt (absolute) or --nudge (relative)
+  zoom                  set zoom, 100..150
+  preset save|load|clear   PTZ preset slots 1-3
+  info                  device identity and node paths
+
+The PIXY has two control surfaces and this helper deliberately uses each for
+what it is good at:
+
+  * UVC (V4L2 on /dev/videoN) for pan, tilt, and zoom. These are absolute AND
+    readable, so the panel can show a real position rather than dead-reckoning.
+  * The vendor HID interface (/dev/hidrawN) for what UVC omits: the
+    Standard/Tracking/Privacy control mode.
+
+The camera also exposes HID PTZ commands (group 03/63). They are NOT used
+here. Testing against the hardware showed they move the motors while leaving
+the UVC position readback untouched, so mixing the two paths desynchronizes
+the readout permanently — a panel that cannot trust its own position display
+is worse than one with a slightly smaller feature set.
+
+V4L2 controls are driven through raw ioctls rather than by shelling out to
+`v4l2-ctl`, so the plugin needs only Python 3 standard library: no build step,
+no pip install, and no v4l-utils dependency.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import errno
+import fcntl
+import glob
+import json
+import os
+import select
+import struct
+import sys
+import time
+
+# ---------------------------------------------------------------- device ids
+
+VENDOR_ID = "328F"
+PRODUCT_ID = "00C0"
+
+# The vendor HID interface advertises usage page 0x83 / usage 0x83. The camera
+# exposes several HID nodes and only this one answers vendor reports, so the
+# report descriptor is what distinguishes it — matching on the USB ids alone
+# would pick whichever node udev happened to enumerate first.
+VENDOR_USAGE_SIGNATURE = b"\x05\x83\x09\x83"
+
+# ---------------------------------------------------------------- V4L2 ioctls
+#
+# Hand-rolled because the stdlib has no V4L2 binding. Only the calls the panel
+# needs are defined; each struct layout is pinned by an explicit size so a
+# mismatch fails loudly at the ioctl rather than silently reading garbage.
+
+_IOC_NONE, _IOC_WRITE, _IOC_READ = 0, 1, 2
+
+
+def _ioc(direction: int, type_char: str, nr: int, size: int) -> int:
+    return (direction << 30) | (size << 16) | (ord(type_char) << 8) | nr
+
+
+QUERYCAP_SIZE = 104
+QUERYCTRL_SIZE = 68
+QUERYMENU_SIZE = 44
+CTRL_SIZE = 8
+
+VIDIOC_QUERYCAP = _ioc(_IOC_READ, "V", 0, QUERYCAP_SIZE)
+VIDIOC_QUERYCTRL = _ioc(_IOC_READ | _IOC_WRITE, "V", 36, QUERYCTRL_SIZE)
+VIDIOC_QUERYMENU = _ioc(_IOC_READ | _IOC_WRITE, "V", 37, QUERYMENU_SIZE)
+VIDIOC_G_CTRL = _ioc(_IOC_READ | _IOC_WRITE, "V", 27, CTRL_SIZE)
+VIDIOC_S_CTRL = _ioc(_IOC_READ | _IOC_WRITE, "V", 28, CTRL_SIZE)
+
+# Capture. Only needed by `preview`; the control path never touches these.
+#
+# The PIXY reports READWRITE=false, so frames cannot simply be read() off the
+# node — capture has to go through the mmap streaming dance: request buffers,
+# map them, queue them, STREAMON, then dequeue/requeue each frame. Four ioctls
+# and an mmap via ctypes, which is more machinery than anything else in this
+# file and is why it lives behind its own subcommand.
+V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
+V4L2_MEMORY_MMAP = 1
+V4L2_FIELD_NONE = 1
+
+FORMAT_SIZE = 208          # struct v4l2_format
+REQBUFS_SIZE = 20          # struct v4l2_requestbuffers
+STREAM_SIZE = 4            # the enum passed to STREAMON/STREAMOFF
+
+# struct v4l2_buffer. Offsets are spelled out rather than expressed as a struct
+# format string, because the struct contains a timeval and two unions whose
+# padding is easy to get wrong — and a wrong offset does not fail loudly, it
+# reads a neighbouring field and mmaps garbage.
+#
+# Taken from `offsetof` on this kernel's headers, not hand-derived: the obvious
+# derivation over-pads v4l2_timecode and lands `memory` 16 bytes late, which
+# fails as ENOTTY several ioctls later. The size below must equal the size the
+# kernel encodes into VIDIOC_QBUF (0xc058560f -> 88), which is the check that
+# catches a mistake here immediately.
+BUF_OFF_INDEX = 0
+BUF_OFF_TYPE = 4
+BUF_OFF_BYTESUSED = 8
+BUF_OFF_MEMORY = 60
+BUF_OFF_OFFSET = 64        # union m, .offset for MMAP buffers
+BUF_OFF_LENGTH = 72
+BUFFER_SIZE = 88
+
+VIDIOC_S_FMT = _ioc(_IOC_READ | _IOC_WRITE, "V", 5, FORMAT_SIZE)
+VIDIOC_REQBUFS = _ioc(_IOC_READ | _IOC_WRITE, "V", 8, REQBUFS_SIZE)
+VIDIOC_QUERYBUF = _ioc(_IOC_READ | _IOC_WRITE, "V", 9, BUFFER_SIZE)
+VIDIOC_QBUF = _ioc(_IOC_READ | _IOC_WRITE, "V", 15, BUFFER_SIZE)
+VIDIOC_DQBUF = _ioc(_IOC_READ | _IOC_WRITE, "V", 17, BUFFER_SIZE)
+VIDIOC_STREAMON = _ioc(_IOC_WRITE, "V", 18, STREAM_SIZE)
+VIDIOC_STREAMOFF = _ioc(_IOC_WRITE, "V", 19, STREAM_SIZE)
+
+
+def fourcc(code: str) -> int:
+    return (ord(code[0]) | (ord(code[1]) << 8) | (ord(code[2]) << 16) | (ord(code[3]) << 24))
+
+
+# YUYV rather than the camera's MJPEG modes, entirely so this file stays
+# standard-library only: YUYV interleaves luma with chroma, so the brightness
+# plane is every other byte and needs no decoding at all. Decoding MJPEG would
+# mean hand-rolling a baseline JPEG decoder, which is a lot of code to write and
+# get subtly wrong for a preview that renders as text.
+PIXFMT_YUYV = fourcc("YUYV")
+
+# The only YUYV sizes this camera offers are 640x480 and 640x360.
+CAPTURE_WIDTH = 640
+CAPTURE_HEIGHT = 480
+
+# Buffers in the queue. Two is enough to keep the driver fed while one is being
+# read, and keeps the mapped footprint at ~1.2 MB.
+CAPTURE_BUFFERS = 2
+
+# struct v4l2_queryctrl: id, type, name[32], min, max, step, default, flags, reserved[2]
+QUERYCTRL_FORMAT = "<II32siiiiI8x"
+CTRL_FORMAT = "<Ii"
+
+# struct v4l2_querymenu: id, index, name[32] (union with __s64 value), reserved
+QUERYMENU_FORMAT = "<II32sI"
+
+V4L2_CTRL_FLAG_DISABLED = 0x0001
+V4L2_CTRL_FLAG_INACTIVE = 0x0010
+
+V4L2_CTRL_TYPE_INTEGER = 1
+V4L2_CTRL_TYPE_BOOLEAN = 2
+V4L2_CTRL_TYPE_MENU = 3
+
+CTRL_TYPE_NAMES = {
+    V4L2_CTRL_TYPE_INTEGER: "integer",
+    V4L2_CTRL_TYPE_BOOLEAN: "boolean",
+    V4L2_CTRL_TYPE_MENU: "menu",
+}
+
+CID_PAN_ABSOLUTE = 0x009A0908
+CID_TILT_ABSOLUTE = 0x009A0909
+CID_ZOOM_ABSOLUTE = 0x009A090D
+
+# UVC pan/tilt travel in arc-seconds; the panel works in whole degrees.
+ARCSEC_PER_DEGREE = 3600
+
+# ---------------------------------------------------------------- image controls
+#
+# The picture-quality half of the UVC surface: everything that changes how the
+# image looks without moving the lens. Same control plane as pan/tilt/zoom, which
+# has a consequence worth stating because it is the reason this is worth building:
+# these all work while another app holds the capture stream, so the brightness can
+# be fixed *during* the call that revealed it was wrong.
+#
+# Keyed by a stable short name rather than by CID, because the name is what the
+# panel, the CLI, and the saved profiles all speak. Renaming one is a breaking
+# change to saved profiles; adding one is not.
+#
+# `auto` names the control that, while on, makes this one read-only. The driver
+# reports that with V4L2_CTRL_FLAG_INACTIVE and keeps it live, so the panel dims
+# the slider rather than guessing — see `IMAGE_CONTROLS` consumers. On an auto
+# control, `manual` is the value that hands control back, defaulting to 0.
+#
+# `curated` marks the controls the panel shows without being asked. The split is
+# editorial, not technical: brightness and contrast are what someone reaches for
+# when the picture looks wrong, while gain and hue are things you set once a year
+# if ever. Everything not curated is still fully available, just behind the cog.
+IMAGE_CONTROLS = (
+    {"key": "brightness", "cid": 0x00980900, "label": "Brightness", "curated": True},
+    {"key": "contrast", "cid": 0x00980901, "label": "Contrast", "curated": True},
+    {"key": "saturation", "cid": 0x00980902, "label": "Saturation", "curated": True},
+    {"key": "sharpness", "cid": 0x0098091B, "label": "Sharpness", "curated": True},
+    {"key": "gamma", "cid": 0x00980910, "label": "Gamma", "curated": True},
+    {"key": "whiteBalanceAuto", "cid": 0x0098090C, "label": "Auto white balance",
+     "curated": True},
+    {"key": "whiteBalance", "cid": 0x0098091A, "label": "White balance",
+     "curated": True, "auto": "whiteBalanceAuto", "unit": "K"},
+    {"key": "hue", "cid": 0x00980903, "label": "Hue"},
+    {"key": "gain", "cid": 0x00980913, "label": "Gain"},
+    # `manual` is the value that hands control back to the user, and it is not
+    # always 0: this is a menu, not a switch, and its Manual Mode is index 1.
+    # Index 0 does not exist on this camera at all.
+    {"key": "autoExposure", "cid": 0x009A0901, "label": "Auto exposure", "manual": 1},
+    {"key": "exposure", "cid": 0x009A0902, "label": "Exposure time",
+     "auto": "autoExposure"},
+    {"key": "focusAuto", "cid": 0x009A090C, "label": "Autofocus"},
+    {"key": "focus", "cid": 0x009A090A, "label": "Focus", "auto": "focusAuto"},
+    {"key": "powerLineFrequency", "cid": 0x00980918, "label": "Power line frequency"},
+    {"key": "backlightCompensation", "cid": 0x0098091C,
+     "label": "Backlight compensation"},
+)
+
+IMAGE_BY_KEY = {c["key"]: c for c in IMAGE_CONTROLS}
+
+# Left alone by `--reset`, because the driver's default is not a sane default
+# here: it reports 60 Hz, so a reset on 50 Hz mains would introduce the flicker
+# the control exists to remove. It stays settable, just not resettable — the
+# right value is a property of the room, not of the picture.
+RESET_EXCLUDE = ("powerLineFrequency",)
+
+# Deliberately not in IMAGE_CONTROLS, and worth saying why so it does not get
+# "fixed" back in: the PIXY advertises `Zoom, Continuous` (0x009A090F) with the
+# range [0..0]. Writes to it succeed and change nothing. Included, it would render
+# as a slider that cannot move — so it is excluded here rather than filtered in the
+# panel, because a control with no range is not a control.
+
+# ---------------------------------------------------------------- HID protocol
+#
+# Reports are 32 bytes, start with report id 0x09, and are zero-padded. Layout:
+#   09 GG AA BB 00 LL 00 LL <payload...>
+# where GG is the command group and LL the payload length, stated twice.
+# See docs/PROTOCOL.md for the derivation and the capture provenance.
+
+REPORT_SIZE = 32
+REPORT_ID = 0x09
+
+GROUP_TRACKING = 0x01
+
+MODE_VALUES = {"standard": 0x00, "tracking": 0x01, "privacy": 0x02}
+MODE_NAMES = {value: name for name, value in MODE_VALUES.items()}
+
+# A vendor query is a write followed by a read on the same fd. The camera can
+# answer slowly enough that a single attempt misses the reply, and a reply left
+# unread is then drained by the *next* query — which is what makes an unretried
+# read look like an intermittently broken device.
+QUERY_TIMEOUT = 0.6
+QUERY_ATTEMPTS = 4
+REPORT_GAP = 0.025
+
+# How long the motors need for a full sweep before a readback means anything.
+PTZ_SETTLE = 0.35
+
+PRESET_SLOTS = (1, 2, 3)
+
+
+def state_path() -> str:
+    """Where saved framing presets and image profiles live.
+
+    Presets are stored on this machine rather than in the camera's own preset
+    slots. The camera has three HID slots, but they hold positions in the HID
+    coordinate space, which testing showed does not agree with the UVC space
+    the panel drives — a slot saved by this panel and loaded by EMEET Studio
+    would point somewhere else. Keeping them local means "save" and "load" are
+    exact inverses, which is the only behavior worth shipping.
+
+    One file, two independent stores under separate keys — see `read_store`.
+    """
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state"
+    )
+    return os.path.join(base, "omarchy-emeet-pixy", "presets.json")
+
+
+# ---------------------------------------------------------------- discovery
+
+
+def read_sysfs(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def read_sysfs_bytes(path: str) -> bytes:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return b""
+
+
+def is_pixy_uevent(text: str) -> bool:
+    upper = text.upper()
+    by_id = VENDOR_ID in upper and PRODUCT_ID in upper
+    by_name = "EMEET" in upper and "PIXY" in upper
+    return by_id or by_name
+
+
+def find_hidraw() -> str | None:
+    """Locate the PIXY's vendor HID node.
+
+    Prefers a node whose report descriptor carries the vendor usage pair, and
+    only falls back to id/name matching so a firmware that describes itself
+    differently still works rather than reporting no camera at all.
+    """
+    override = os.environ.get("PIXY_HIDRAW")
+    if override:
+        return override if os.path.exists(override) else None
+
+    ranked: list[tuple[int, str]] = []
+    for path in sorted(glob.glob("/dev/hidraw*")):
+        name = os.path.basename(path)
+        device = f"/sys/class/hidraw/{name}/device"
+        if not is_pixy_uevent(read_sysfs(f"{device}/uevent")):
+            continue
+        descriptor = read_sysfs_bytes(f"{device}/report_descriptor")
+        rank = 0 if VENDOR_USAGE_SIGNATURE in descriptor else 10
+        ranked.append((rank, path))
+    if not ranked:
+        return None
+    return min(ranked)[1]
+
+
+def video_capture_nodes() -> list[str]:
+    """Every /dev/videoN belonging to the PIXY that can actually capture.
+
+    The camera claims two video nodes and only the first captures video; the
+    second is a metadata node. QUERYCAP is what tells them apart.
+    """
+    found = []
+    for path in sorted(glob.glob("/dev/video*"), key=lambda p: (len(p), p)):
+        name = os.path.basename(path)
+        uevent = read_sysfs(f"/sys/class/video4linux/{name}/device/uevent")
+        modalias = read_sysfs(f"/sys/class/video4linux/{name}/device/modalias")
+        card = read_sysfs(f"/sys/class/video4linux/{name}/name")
+        if not (is_pixy_uevent(uevent + modalias) or is_pixy_uevent(card)):
+            continue
+        found.append(path)
+    return found
+
+
+def find_video() -> str | None:
+    """The PIXY's capture node, or None."""
+    override = os.environ.get("PIXY_VIDEO")
+    if override:
+        return override if os.path.exists(override) else None
+    for path in video_capture_nodes():
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        except OSError:
+            continue
+        try:
+            if capability(fd) is not None:
+                return path
+        finally:
+            os.close(fd)
+    return None
+
+
+def capability(fd: int) -> dict | None:
+    """QUERYCAP, or None when this node cannot capture video."""
+    buf = bytearray(QUERYCAP_SIZE)
+    try:
+        fcntl.ioctl(fd, VIDIOC_QUERYCAP, buf, True)
+    except OSError:
+        return None
+    caps = struct.unpack_from("<I", buf, 84)[0]
+    device_caps = struct.unpack_from("<I", buf, 88)[0]
+    V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+    effective = device_caps or caps
+    if not effective & V4L2_CAP_VIDEO_CAPTURE:
+        return None
+    return {
+        "driver": buf[0:16].split(b"\0")[0].decode("utf-8", "replace"),
+        "card": buf[16:48].split(b"\0")[0].decode("utf-8", "replace"),
+        "bus": buf[48:80].split(b"\0")[0].decode("utf-8", "replace"),
+    }
+
+
+# Subcommands that open the capture stream. Every *other* subcommand opens the
+# video node too — the control ioctls need an fd — but only these ones capture,
+# and that distinction is what is_control_helper exists to draw.
+CAPTURING_COMMANDS = frozenset({"preview"})
+
+SELF_PATH = os.path.realpath(__file__)
+
+# What marks a file as a copy of this helper. Deliberately a line of the module
+# docstring: it is the first thing in the file, so the check reads one block, and
+# it cannot be true of a file that merely shares the name `pixy`.
+HELPER_SIGNATURE = b"EMEET PIXY webcam control for the Omarchy shell"
+
+
+def is_helper_script(path: str) -> bool:
+    """True when `path` is a copy of this helper.
+
+    Any copy, not only this one. The plugin is *installed* by copying the tree
+    into ~/.config/omarchy/plugins, so the panel's helpers and a hand-run
+    `./scripts/pixy holders` from the checkout are different files — and the
+    README recommends exactly that command for "what is using my webcam". Path
+    equality would answer `In use by python3` there, which is the bug this whole
+    function exists to prevent, just reached from the other direction.
+
+    Widening from "my file" to "a pixy helper" is sound because the claim being
+    made is about the fd, not about ownership: a control run of *any* copy holds
+    the node without streaming from it.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return HELPER_SIGNATURE in fh.read(4096)
+    except OSError:
+        return False
+
+
+def is_control_helper(pid: int) -> bool:
+    """True when `pid` is a run of this helper that is not capturing.
+
+    *(observed)* Every control subcommand has to open() the video node to reach
+    its ioctls, so while `image` or `state` runs it appears in a /proc fd scan
+    looking exactly like a video call. The panel spawns those constantly and
+    polls `holders` every 1.5 s alongside them, so without this it catches its
+    own helpers and reports the camera as "In use by python3" — which is how the
+    user found it. The wrong label is the smaller half of the bug: `streaming`
+    also drives the panel to release the preview, so a routine image refresh
+    could knock the preview out to yield the camera to nothing.
+
+    Identified by what the file *is*, not by what the process is called. "Is it
+    called python3" would also dismiss a genuine unrelated Python program
+    capturing video, which is precisely the thing the panel must report.
+    `preview` stays a holder because it genuinely is one: a preview running in a
+    terminal is exactly the conflict the panel needs to see.
+    """
+    raw = read_sysfs_bytes(f"/proc/{pid}/cmdline")
+    if not raw:
+        # Kernel threads have an empty cmdline, and a process that exits between
+        # the fd scan and here leaves nothing to read. Neither is ours.
+        return False
+    argv = [arg.decode("utf-8", "replace") for arg in raw.split(b"\0") if arg]
+    for i, arg in enumerate(argv):
+        if os.path.basename(arg) != os.path.basename(SELF_PATH):
+            continue
+        # A relative argv[0] is relative to *that* process's directory, not
+        # ours, so it is resolved through its /proc cwd link. The panel always
+        # passes an absolute path; a hand-run `./scripts/pixy` does not.
+        path = arg if os.path.isabs(arg) else f"/proc/{pid}/cwd/{arg}"
+        if os.path.realpath(path) != SELF_PATH and not is_helper_script(path):
+            continue
+        # The subcommand is the first positional after the script. There are no
+        # global options ahead of it, so the first non-flag argument is it.
+        for rest in argv[i + 1:]:
+            if not rest.startswith("-"):
+                return rest not in CAPTURING_COMMANDS
+        # Our script with no subcommand at all: argparse is about to reject it,
+        # so it is certainly not capturing.
+        return True
+    return False
+
+
+def stream_holders(node: str) -> tuple[list[int], list[int]]:
+    """PIDs holding the capture node open, split into (others, ours).
+
+    Only one process can hold the V4L2 stream, so who has it is the difference
+    between "zoom did nothing" and "zoom is broken". Reported as data so the
+    panel can say which it is. Requires no privileges for our own processes and
+    silently skips others.
+
+    The split matters, and getting it wrong is a real bug rather than a cosmetic
+    one. Our caller's pid ("ours") is the shell, which is also the process
+    running the panel's video preview. Folding it in with everything else makes
+    an open panel report "in use by quickshell" — true of the fd, useless to the
+    reader. But *discarding* it is worse: the panel then cannot tell that its own
+    preview is the thing holding the camera, so it never yields, and another app
+    starting a call gets EBUSY while the panel cheerfully reports the camera as
+    free. Both facts are needed, so both are returned.
+
+    Sibling runs of this script are dropped from both lists — see
+    is_control_helper for why an fd on the node does not mean a stream.
+    """
+    try:
+        target = os.stat(node).st_rdev
+    except OSError:
+        return [], []
+    pids = set()
+    for entry in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            if os.stat(entry).st_rdev == target:
+                pids.add(int(entry.split("/")[2]))
+        except (OSError, ValueError):
+            continue
+    # This helper process itself is never interesting: it is about to exit, and
+    # on a `preview` run it is the thing doing the capturing.
+    pids.discard(os.getpid())
+    ours = os.getppid()
+    others = sorted(p for p in pids if p != ours)
+    # Sibling control helpers are the same non-answer as this process: they hold
+    # an fd for their ioctls and are about to exit. Filtered last so the scan
+    # itself stays a pure rdev comparison, and so the /proc reads below only
+    # happen for the handful of pids that actually matched the node.
+    return [p for p in others if not is_control_helper(p)], (
+        [ours] if ours in pids else []
+    )
+
+
+def process_name(pid: int) -> str:
+    comm = read_sysfs(f"/proc/{pid}/comm").strip()
+    return comm or str(pid)
+
+
+# ---------------------------------------------------------------- V4L2 access
+
+
+def query_control(fd: int, cid: int) -> dict | None:
+    """Range and flags for one control, or None when unsupported."""
+    buf = bytearray(struct.pack(QUERYCTRL_FORMAT, cid, 0, b"", 0, 0, 0, 0, 0))
+    try:
+        fcntl.ioctl(fd, VIDIOC_QUERYCTRL, buf, True)
+    except OSError:
+        return None
+    _id, ctrl_type, name, minimum, maximum, step, default, flags = struct.unpack(
+        QUERYCTRL_FORMAT, bytes(buf)
+    )
+    if flags & V4L2_CTRL_FLAG_DISABLED:
+        return None
+    return {
+        "name": name.split(b"\0")[0].decode("utf-8", "replace"),
+        "min": minimum,
+        "max": maximum,
+        "step": max(1, step),
+        "default": default,
+        "inactive": bool(flags & V4L2_CTRL_FLAG_INACTIVE),
+        # The raw number as well as the friendly name: unpacked but discarded by
+        # an earlier version, and it is what decides whether a control renders as
+        # a slider, a switch, or a set of chips.
+        "type": CTRL_TYPE_NAMES.get(ctrl_type, "unknown"),
+        "typeRaw": ctrl_type,
+    }
+
+
+def enumerate_menu(fd: int, cid: int, lo: int, hi: int) -> list:
+    """The selectable options of a menu control, as {value, label} entries.
+
+    A menu's advertised range lies, and this camera's `Auto Exposure` is the
+    example: it claims [0..3] but only 1 and 3 exist (Manual Mode and Aperture
+    Priority Mode). Indices that do not exist fail VIDIOC_QUERYMENU with EINVAL,
+    so enumerating is what separates the real options from the claimed range —
+    otherwise the panel would draw four exposure chips where two do nothing.
+
+    Read-only, deliberately. An earlier version also test-wrote each index to
+    catch options that enumerate but reject; measuring found nothing that
+    enumeration missed, and the probe had a real cost — writing `Manual Mode` to
+    learn it is writable changes the exposure of whatever call is in progress.
+    Being wrong about a hypothetical option is cheaper than that.
+    """
+    options = []
+    for index in range(lo, hi + 1):
+        buf = bytearray(struct.pack(QUERYMENU_FORMAT, cid, index, b"", 0))
+        try:
+            fcntl.ioctl(fd, VIDIOC_QUERYMENU, buf, True)
+        except OSError:
+            continue
+        _id, _index, raw_name, _reserved = struct.unpack(QUERYMENU_FORMAT, bytes(buf))
+        label = raw_name.split(b"\0")[0].decode("utf-8", "replace")
+        if not label:
+            continue
+        options.append({"value": index, "label": label})
+    return options
+
+
+def get_control(fd: int, cid: int) -> int | None:
+    buf = bytearray(struct.pack(CTRL_FORMAT, cid, 0))
+    try:
+        fcntl.ioctl(fd, VIDIOC_G_CTRL, buf, True)
+    except OSError:
+        return None
+    return struct.unpack(CTRL_FORMAT, bytes(buf))[1]
+
+
+def set_control(fd: int, cid: int, value: int) -> bool:
+    buf = bytearray(struct.pack(CTRL_FORMAT, cid, int(value)))
+    try:
+        fcntl.ioctl(fd, VIDIOC_S_CTRL, buf, True)
+    except OSError:
+        return False
+    return True
+
+
+def snap(value: float, spec: dict) -> int:
+    """Clamp into the control's range and land on a step boundary.
+
+    Pan and tilt step in whole degrees (3600 arc-seconds). Writing an unsnapped
+    value makes the driver round it, so the readback disagrees with what the
+    slider was set to and the handle jumps on the next refresh.
+    """
+    low, high, step = spec["min"], spec["max"], spec["step"]
+    clamped = max(low, min(high, int(round(float(value)))))
+    if step > 1:
+        clamped = low + int(round((clamped - low) / step)) * step
+        clamped = max(low, min(high, clamped))
+    return clamped
+
+
+class Camera:
+    """The camera's UVC surface. Opened lazily, closed on exit.
+
+    Opened O_NONBLOCK so a node held by a meeting app never blocks the panel's
+    refresh, and never for capture — this only ever issues control ioctls, so
+    it does not take the stream away from whoever is using it.
+    """
+
+    def __init__(self, node: str):
+        self.node = node
+        self.fd: int | None = None
+
+    def __enter__(self) -> "Camera":
+        self.fd = os.open(self.node, os.O_RDWR | os.O_NONBLOCK)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def spec(self, cid: int) -> dict | None:
+        return query_control(self.fd, cid)
+
+    def get(self, cid: int) -> int | None:
+        return get_control(self.fd, cid)
+
+    def set(self, cid: int, value: int) -> bool:
+        return set_control(self.fd, cid, value)
+
+    def menu(self, cid: int, lo: int, hi: int) -> list:
+        return enumerate_menu(self.fd, cid, lo, hi)
+
+
+# ---------------------------------------------------------------- HID access
+
+
+def build_report(payload) -> bytes:
+    """Pad a payload to a 32-byte report, rejecting anything malformed.
+
+    Deliberately strict. This is the only function that produces bytes for the
+    camera, so validating here means a bad value cannot reach the hardware from
+    any call site.
+    """
+    data = list(payload)
+    if not data or data[0] != REPORT_ID:
+        raise ValueError("HID reports must start with report id 0x09")
+    if len(data) > REPORT_SIZE:
+        raise ValueError(f"HID report cannot exceed {REPORT_SIZE} bytes")
+    if any(not isinstance(b, int) or b < 0 or b > 0xFF for b in data):
+        raise ValueError("HID report bytes must be in range 0..255")
+    return bytes(data) + bytes(REPORT_SIZE - len(data))
+
+
+def write_reports(path: str, reports: list[bytes]) -> None:
+    """Write reports in order, pausing between them.
+
+    The gap matters: the camera acknowledges a config report before it is ready
+    for the commit that follows, and back-to-back writes get dropped.
+    """
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        for index, report in enumerate(reports):
+            os.write(fd, report)
+            if index < len(reports) - 1:
+                time.sleep(REPORT_GAP)
+    finally:
+        os.close(fd)
+
+
+def drain(fd: int) -> None:
+    """Discard unread reports so a query cannot read a previous reply."""
+    while select.select([fd], [], [], 0)[0]:
+        try:
+            if not os.read(fd, 64):
+                return
+        except (BlockingIOError, OSError):
+            return
+
+
+def query(path: str, payload) -> bytes | None:
+    """Send a vendor query and return the matching reply, or None.
+
+    Replies are matched on report id and command group, because the camera
+    emits unsolicited status reports too — accepting the first thing that
+    arrives decodes another group's payload as if it were ours. The group byte
+    can carry high bits set, so it is masked before comparing.
+    """
+    report = build_report(payload)
+    group = report[1] & 0x1F
+    for _ in range(QUERY_ATTEMPTS):
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        except OSError:
+            return None
+        try:
+            drain(fd)
+            os.write(fd, report)
+            deadline = time.monotonic() + QUERY_TIMEOUT
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if not select.select([fd], [], [], remaining)[0]:
+                    break
+                try:
+                    reply = os.read(fd, 64)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    break
+                if reply and reply[0] == REPORT_ID and (reply[1] & 0x1F) == group:
+                    return reply
+        finally:
+            os.close(fd)
+        time.sleep(REPORT_GAP)
+    return None
+
+
+def mode_reports(mode: str) -> list[bytes]:
+    value = MODE_VALUES[mode]
+    return [
+        build_report([0x09, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, value]),
+        build_report([0x09, 0x01, 0x01, 0x01]),
+    ]
+
+
+def read_mode(path: str, streaming: bool = True) -> tuple[str | None, int | None]:
+    """Read the control mode. Returns (mode or None, raw byte or None).
+
+    Values 0x00/0x01/0x02 are Standard/Tracking/Privacy and mean exactly that
+    whenever they appear. 0x03 is the ambiguous one: an idle camera answers it
+    for both Standard and Tracking, so it is reported as unknown rather than
+    resolved to a guess.
+
+    In practice that means Privacy is always readable — it answers 0x02 whether
+    or not anything holds the stream, which is what lets the privacy toggle work
+    on an idle camera — while telling Standard from Tracking needs a stream. The
+    `streaming` argument is accepted so callers can explain *why* a mode came
+    back unknown, and is deliberately not used to gate the decode.
+    """
+    reply = query(path, [0x09, 0x01, 0x01, 0x01])
+    if not reply or len(reply) < 9:
+        return None, None
+    raw = reply[8]
+    return MODE_NAMES.get(raw), raw
+
+
+# ---------------------------------------------------------------- saved state
+#
+# Two stores in one file: `slots` holds framing presets (pan/tilt/zoom) and
+# `profiles` holds image profiles (brightness, contrast, and friends). They are
+# deliberately separate documents rather than one combined "scene", because
+# recalling a framing preset must not silently change how the picture looks —
+# that was an explicit design decision, not an oversight.
+#
+# The consequence for this code is that every write is read-modify-write: the
+# file is replaced wholesale, so writing one key without preserving the other
+# would erase it.
+
+
+def read_store() -> dict:
+    """The whole saved document, or an empty one when there is nothing readable.
+
+    A missing file, unreadable file, or malformed JSON all mean the same thing to
+    every caller — no saved state — so none of them are distinguished here.
+    """
+    try:
+        with open(state_path(), "r", encoding="utf-8") as fh:
+            blob = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return blob if isinstance(blob, dict) else {}
+
+
+def write_store(blob: dict) -> bool:
+    """Persist the whole document. Written via a temp file so a concurrent read
+    never observes a half-written object."""
+    path = state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(blob, fh)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def read_presets() -> dict:
+    slots = read_store().get("slots")
+    if not isinstance(slots, dict):
+        return {}
+    clean = {}
+    for key, entry in slots.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            slot = int(key)
+        except (TypeError, ValueError):
+            continue
+        if slot not in PRESET_SLOTS:
+            continue
+        try:
+            clean[slot] = {
+                "pan": int(entry["pan"]),
+                "tilt": int(entry["tilt"]),
+                "zoom": int(entry["zoom"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+    return clean
+
+
+def write_presets(slots: dict) -> bool:
+    """Replace the framing presets, leaving image profiles as they were."""
+    blob = read_store()
+    blob["slots"] = {str(k): v for k, v in sorted(slots.items())}
+    return write_store(blob)
+
+
+def read_profiles() -> dict:
+    """Saved image profiles as {name: {key: value}}.
+
+    Validated on the way out rather than trusted: only keys this build knows
+    survive, and only integer values. A profile saved by a later version that
+    adds controls therefore loads as its recognized subset instead of failing —
+    which is the behavior that keeps a downgrade from looking like data loss.
+    """
+    profiles = read_store().get("profiles")
+    if not isinstance(profiles, dict):
+        return {}
+    clean = {}
+    for name, entry in profiles.items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            continue
+        values = {}
+        for key, value in entry.items():
+            if key not in IMAGE_BY_KEY:
+                continue
+            try:
+                values[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+        if values:
+            clean[name] = values
+    return clean
+
+
+def write_profiles(profiles: dict) -> bool:
+    """Replace the image profiles, leaving framing presets as they were."""
+    blob = read_store()
+    blob["profiles"] = {k: profiles[k] for k in sorted(profiles)}
+    return write_store(blob)
+
+
+# ---------------------------------------------------------------- capture
+#
+# Everything from here to the next divider exists only for `preview`. It is the
+# one part of this helper that opens the video stream, which has a consequence
+# worth stating plainly: while a preview runs, the camera is live and its
+# activity light is on. That is why the panel only previews while its popout is
+# open, and stops the moment it closes.
+
+
+# Brightness ramps, darkest to lightest, ordered by ink coverage rather than by
+# character value. The shades matter: with only a couple of steps a face reads as
+# a threshold rather than as a face.
+ASCII_RAMP = " .:-=+*#%@"
+BLOCK_RAMP = " ░▒▓█"
+
+
+class Capture:
+    """Streaming YUYV capture, in the smallest form that works.
+
+    Written as a context manager because the teardown genuinely matters: a
+    stream left on holds the camera against every other app on the system, and
+    mapped buffers survive the fd if they are not explicitly unmapped. Every
+    acquisition step is undone in __exit__, in reverse.
+    """
+
+    def __init__(self, node: str, width: int = CAPTURE_WIDTH, height: int = CAPTURE_HEIGHT):
+        self.node = node
+        self.width = width
+        self.height = height
+        self.fd: int | None = None
+        self.buffers: list = []
+        self.streaming = False
+        self._libc = None
+
+    def __enter__(self) -> "Capture":
+        # Blocking, unlike the control path: a capture that returns immediately
+        # with no frame is useless, and the dequeue is what we want to wait on.
+        self.fd = os.open(self.node, os.O_RDWR)
+        try:
+            self._set_format()
+            self._request_buffers()
+            self._map_buffers()
+            self._queue_all()
+            self._stream_on()
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.streaming:
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_STREAMOFF,
+                            struct.pack("<I", V4L2_BUF_TYPE_VIDEO_CAPTURE))
+            except OSError:
+                pass
+            self.streaming = False
+        for addr, length in self.buffers:
+            try:
+                self.libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(length))
+            except Exception:
+                pass
+        self.buffers = []
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    @property
+    def libc(self):
+        if self._libc is None:
+            self._libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            self._libc.mmap.restype = ctypes.c_void_p
+            self._libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_long]
+            self._libc.munmap.restype = ctypes.c_int
+            self._libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        return self._libc
+
+    def _set_format(self) -> None:
+        buf = bytearray(FORMAT_SIZE)
+        struct.pack_into("<I", buf, 0, V4L2_BUF_TYPE_VIDEO_CAPTURE)
+        # struct v4l2_pix_format starts at offset 8 (after type + 4 bytes pad).
+        struct.pack_into("<IIII", buf, 8, self.width, self.height, PIXFMT_YUYV, V4L2_FIELD_NONE)
+        fcntl.ioctl(self.fd, VIDIOC_S_FMT, buf, True)
+        # The driver rewrites these to what it actually accepted, so read them
+        # back rather than trusting the request — a size that was silently
+        # adjusted would misalign every row of the output.
+        self.width, self.height = struct.unpack_from("<II", buf, 8)
+        pixfmt = struct.unpack_from("<I", buf, 16)[0]
+        if pixfmt != PIXFMT_YUYV:
+            raise OSError(errno.ENODEV, "camera would not accept YUYV")
+        self.bytes_per_line = struct.unpack_from("<I", buf, 24)[0] or self.width * 2
+
+    def _request_buffers(self) -> None:
+        buf = bytearray(REQBUFS_SIZE)
+        struct.pack_into("<III", buf, 0, CAPTURE_BUFFERS,
+                         V4L2_BUF_TYPE_VIDEO_CAPTURE, V4L2_MEMORY_MMAP)
+        fcntl.ioctl(self.fd, VIDIOC_REQBUFS, buf, True)
+        self.count = struct.unpack_from("<I", buf, 0)[0]
+        if self.count < 1:
+            raise OSError(errno.ENOMEM, "no capture buffers available")
+
+    def _buffer_struct(self, index: int) -> bytearray:
+        buf = bytearray(BUFFER_SIZE)
+        struct.pack_into("<I", buf, BUF_OFF_INDEX, index)
+        struct.pack_into("<I", buf, BUF_OFF_TYPE, V4L2_BUF_TYPE_VIDEO_CAPTURE)
+        struct.pack_into("<I", buf, BUF_OFF_MEMORY, V4L2_MEMORY_MMAP)
+        return buf
+
+    def _map_buffers(self) -> None:
+        PROT_READ, PROT_WRITE, MAP_SHARED = 0x1, 0x2, 0x001
+        for index in range(self.count):
+            buf = self._buffer_struct(index)
+            fcntl.ioctl(self.fd, VIDIOC_QUERYBUF, buf, True)
+            length = struct.unpack_from("<I", buf, BUF_OFF_LENGTH)[0]
+            offset = struct.unpack_from("<I", buf, BUF_OFF_OFFSET)[0]
+            addr = self.libc.mmap(None, ctypes.c_size_t(length),
+                                  PROT_READ | PROT_WRITE, MAP_SHARED,
+                                  self.fd, offset)
+            if not addr or addr == ctypes.c_void_p(-1).value:
+                raise OSError(ctypes.get_errno(), "mmap of capture buffer failed")
+            self.buffers.append((addr, length))
+
+    def _queue_all(self) -> None:
+        for index in range(self.count):
+            fcntl.ioctl(self.fd, VIDIOC_QBUF, self._buffer_struct(index), True)
+
+    def _stream_on(self) -> None:
+        fcntl.ioctl(self.fd, VIDIOC_STREAMON,
+                    struct.pack("<I", V4L2_BUF_TYPE_VIDEO_CAPTURE))
+        self.streaming = True
+
+    def frame(self, timeout: float = 2.0) -> bytes:
+        """Dequeue one frame, copy its luma plane, and requeue the buffer.
+
+        The buffer goes back in the queue before returning, so a caller that
+        drops the frame cannot starve the driver.
+        """
+        if not select.select([self.fd], [], [], timeout)[0]:
+            raise OSError(errno.ETIMEDOUT, "no frame arrived")
+        buf = bytearray(BUFFER_SIZE)
+        struct.pack_into("<I", buf, BUF_OFF_TYPE, V4L2_BUF_TYPE_VIDEO_CAPTURE)
+        struct.pack_into("<I", buf, BUF_OFF_MEMORY, V4L2_MEMORY_MMAP)
+        fcntl.ioctl(self.fd, VIDIOC_DQBUF, buf, True)
+        index = struct.unpack_from("<I", buf, BUF_OFF_INDEX)[0]
+        used = struct.unpack_from("<I", buf, BUF_OFF_BYTESUSED)[0]
+        addr, length = self.buffers[index]
+        try:
+            size = min(used or length, length)
+            data = ctypes.string_at(ctypes.c_void_p(addr), size)
+        finally:
+            fcntl.ioctl(self.fd, VIDIOC_QBUF, self._buffer_struct(index), True)
+        return data
+
+
+def sample_luma(frame: bytes, width: int, height: int, bytes_per_line: int,
+                columns: int, rows: int) -> list:
+    """Box-average a YUYV frame's luma plane down to a columns x rows grid.
+
+    In YUYV every second byte is luma, so byte 2*x of a row is pixel x's
+    brightness — no decoding, no chroma arithmetic. Averaging over each cell
+    rather than point-sampling matters at this reduction: a 640-wide frame into
+    ~60 columns discards 90% of the pixels, and picking one of them makes noise
+    look like detail.
+    """
+    if columns < 1 or rows < 1 or not frame:
+        return []
+    grid = []
+    for row in range(rows):
+        y0 = row * height // rows
+        y1 = max(y0 + 1, (row + 1) * height // rows)
+        line = []
+        for col in range(columns):
+            x0 = col * width // columns
+            x1 = max(x0 + 1, (col + 1) * width // columns)
+            total = count = 0
+            # Step through the cell rather than visiting every pixel: at most a
+            # few samples per axis is plenty for a text-sized cell and keeps a
+            # frame's cost flat as the capture resolution grows.
+            for y in range(y0, y1, max(1, (y1 - y0) // 3)):
+                base = y * bytes_per_line
+                for x in range(x0, x1, max(1, (x1 - x0) // 3)):
+                    offset = base + x * 2
+                    if offset < len(frame):
+                        total += frame[offset]
+                        count += 1
+            line.append(total // count if count else 0)
+        grid.append(line)
+    return grid
+
+
+def stretch(grid: list, clip: float = 0.02) -> tuple:
+    """Find the grid's black and white points, ignoring outliers.
+
+    Webcam luma rarely spans 0..255 — an indoor frame might sit in 40..170, and
+    mapping that raw onto the ramp yields uniform mud. So the range is measured
+    rather than assumed.
+
+    Measuring it with min/max is not enough though: one lamp or bright window
+    takes the top of the range on its own and crushes the whole subject into the
+    darkest step or two. Clipping a few percent off each end throws those
+    outliers away and spends the ramp on the part of the frame you are actually
+    looking at. Degenerate ranges are widened so the caller never divides by
+    zero on a blank frame.
+    """
+    values = sorted(v for row in grid for v in row)
+    if not values:
+        return 0, 255
+    margin = int(len(values) * clip)
+    low = values[margin]
+    high = values[-1 - margin] if margin else values[-1]
+    if high - low < 8:
+        low = max(0, min(low, 247))
+        return low, low + 8
+    return low, high
+
+
+def render_ascii(grid: list, ramp: str = ASCII_RAMP, invert: bool = False,
+                 levels: tuple | None = None) -> list:
+    """Map a luma grid onto characters, one string per row.
+
+    `levels` overrides the measured black/white points, which is what lets a
+    half-block render share one exposure across both of its half-rows.
+    """
+    if not grid:
+        return []
+    low, high = levels if levels else stretch(grid)
+    span = max(1, high - low)
+    steps = len(ramp) - 1
+    lines = []
+    for row in grid:
+        chars = []
+        for value in row:
+            level = (value - low) * steps // span
+            level = max(0, min(steps, level))
+            chars.append(ramp[steps - level if invert else level])
+        lines.append("".join(chars))
+    return lines
+
+
+# A monospace character cell is about twice as tall as it is wide. Getting this
+# wrong is the difference between a face and a smear, and it is not obvious from
+# the numbers — 56x16 looks reasonable and renders visibly squashed.
+CELL_ASPECT = 2.0
+
+
+def auto_rows(columns: int) -> int:
+    """Output lines that keep a 4:3 frame looking like a 4:3 frame.
+
+    This is the count of *lines to draw*, which depends only on the cell aspect
+    — half-block mode changes how densely each line is sampled, not how tall a
+    character is, so it wants the same number of lines. Doubling the sampling is
+    cmd_preview's job.
+    """
+    rows = columns * (CAPTURE_HEIGHT / CAPTURE_WIDTH) / CELL_ASPECT
+    return max(4, int(round(rows)))
+
+
+def render_halfblocks(grid: list, invert: bool = False) -> list:
+    """Render two grid rows per output line using half-block characters.
+
+    A character cell is twice as tall as it is wide, so one character per sample
+    squashes the image. Sampling two rows per line and drawing them with ' ',
+    '▀', '▄', '█' restores roughly square pixels and doubles vertical detail for
+    free — the same trick terminal image viewers use.
+
+    The cost is tonal range: each half is either on or off, so shading comes from
+    the pattern rather than from a ramp. That reads better than a 5-step ramp at
+    this size, because edges land in the right place.
+    """
+    if not grid:
+        return []
+    low, high = stretch(grid)
+    mid = (low + high) // 2
+    lines = []
+    for index in range(0, len(grid) - len(grid) % 2, 2):
+        top_row, bottom_row = grid[index], grid[index + 1]
+        chars = []
+        for col in range(min(len(top_row), len(bottom_row))):
+            top = top_row[col] > mid
+            bottom = bottom_row[col] > mid
+            if invert:
+                top, bottom = not top, not bottom
+            chars.append("█" if top and bottom else "▀" if top else "▄" if bottom else " ")
+        lines.append("".join(chars))
+    return lines
+
+
+def cmd_preview(args) -> dict:
+    """Emit ASCII frames as JSON lines until stopped.
+
+    Unlike every other subcommand this one streams: one JSON object per frame,
+    one per line, so the panel can render as frames arrive instead of waiting
+    for the process to exit. It still holds to the same contract — every line is
+    a complete JSON object, and failures arrive as data with exit code 0.
+    """
+    node = find_video()
+    if not node:
+        emit(missing_camera())
+        return None
+
+    ramp = BLOCK_RAMP if args.blocks else ASCII_RAMP
+    columns = max(8, min(200, args.columns))
+    rows = max(4, min(100, args.rows or auto_rows(columns)))
+    # Half-block mode draws two sampled rows per output line, so it samples at
+    # double the requested height and emits the height that was asked for.
+    sample_rows = rows * 2 if args.halfblocks else rows
+    interval = max(0.0, 1.0 / args.fps) if args.fps > 0 else 0.0
+    limit = args.frames if args.frames > 0 else None
+
+    try:
+        with Capture(node) as cap:
+            # The first frames after STREAMON are often black or half-exposed
+            # while the sensor's auto-exposure settles, so they are captured and
+            # discarded rather than shown.
+            for _ in range(args.warmup):
+                try:
+                    cap.frame()
+                except OSError:
+                    break
+
+            sent = 0
+            while limit is None or sent < limit:
+                started = time.monotonic()
+                data = cap.frame()
+                grid = sample_luma(data, cap.width, cap.height,
+                                   cap.bytes_per_line, columns, sample_rows)
+                lines = (render_halfblocks(grid, args.invert) if args.halfblocks
+                         else render_ascii(grid, ramp, args.invert))
+                if args.text:
+                    # Redraw in place so a terminal preview animates instead of
+                    # scrolling: home the cursor, then clear to end of screen.
+                    sys.stdout.write("\033[H\033[J" + "\n".join(lines) + "\n")
+                    sys.stdout.flush()
+                else:
+                    emit({
+                        "ok": True,
+                        "frame": sent,
+                        "width": columns,
+                        "height": rows,
+                        "lines": lines,
+                    })
+                sent += 1
+                if interval:
+                    remaining = interval - (time.monotonic() - started)
+                    if remaining > 0:
+                        time.sleep(remaining)
+    except OSError as exc:
+        # EBUSY is the expected one: a meeting app already has the stream. It is
+        # worth naming precisely, because "device busy" is actionable and
+        # "preview failed" is not.
+        emit({"ok": False, "present": True, "error": describe(exc),
+              "busy": exc.errno == errno.EBUSY})
+    except KeyboardInterrupt:
+        raise
+    return None
+
+
+def emit(payload: dict) -> None:
+    """Write one JSON object and flush.
+
+    Flushing is what makes streaming work: without it Python buffers 8 KB of
+    output and the panel would sit blank until a dozen frames had accumulated.
+    """
+    json.dump(payload, sys.stdout)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------- views
+
+
+def missing_camera(error: str = "no-camera") -> dict:
+    return {
+        "ok": False,
+        "error": error,
+        "present": False,
+        "mode": None,
+        "presets": {},
+    }
+
+
+def read_state(include_presets: bool = True) -> dict:
+    node = find_video()
+    hid = find_hidraw()
+    if not node and not hid:
+        return missing_camera()
+
+    # `streaming` means *another app* holds the stream, which is the question the
+    # panel's UI is asking. `selfStreaming` is the panel's own preview, reported
+    # separately so the panel can recognize itself as the holder and release the
+    # camera when someone else needs it.
+    holders, self_holders = stream_holders(node) if node else ([], [])
+    streaming = bool(holders)
+
+    view: dict = {
+        "ok": True,
+        "present": True,
+        "video": node,
+        "hidraw": hid,
+        "streaming": streaming,
+        "streamUsers": [process_name(pid) for pid in holders],
+        "selfStreaming": bool(self_holders),
+        "presets": {},
+    }
+
+    # Control mode lives on the HID interface, which stays reachable even while
+    # a meeting app holds the video stream — that separation is what lets
+    # privacy be toggled mid-call.
+    if hid:
+        try:
+            mode, raw = read_mode(hid, streaming)
+            view["mode"] = mode
+            view["modeRaw"] = raw
+            # Say why the mode is unknown, so the panel can explain rather than
+            # showing a blank where a value belongs. An idle camera reports the
+            # ambiguous 0x03 for both Standard and Tracking; that is the common
+            # case and is not an error.
+            if mode is None:
+                view["modeUnknown"] = (
+                    "needs-stream" if raw is not None else "no-response"
+                )
+            # Privacy is knowable at all times, so the bar glyph and the privacy
+            # toggle never have to fall back to a guess.
+            view["privacy"] = mode == "privacy"
+        except OSError as exc:
+            view["mode"] = None
+            view["modeUnknown"] = "hid-error"
+            view["hidError"] = describe(exc)
+    else:
+        view["mode"] = None
+        view["modeUnknown"] = "no-hid"
+        view["hidError"] = "vendor HID interface not found"
+
+    if not node:
+        view["videoError"] = "capture node not found"
+        return view
+
+    try:
+        with Camera(node) as cam:
+            cap = capability(cam.fd)
+            if cap:
+                view["card"] = cap["card"]
+                view["driver"] = cap["driver"]
+            for key, cid in (
+                ("pan", CID_PAN_ABSOLUTE),
+                ("tilt", CID_TILT_ABSOLUTE),
+                ("zoom", CID_ZOOM_ABSOLUTE),
+            ):
+                spec = cam.spec(cid)
+                if not spec:
+                    continue
+                raw = cam.get(cid)
+                if raw is None:
+                    continue
+                if key == "zoom":
+                    view["zoom"] = raw
+                    view["zoomMin"] = spec["min"]
+                    view["zoomMax"] = spec["max"]
+                else:
+                    # Degrees for the UI, arc-seconds on the wire.
+                    view[key] = raw // ARCSEC_PER_DEGREE
+                    view[f"{key}Min"] = spec["min"] // ARCSEC_PER_DEGREE
+                    view[f"{key}Max"] = spec["max"] // ARCSEC_PER_DEGREE
+    except OSError as exc:
+        view["videoError"] = describe(exc)
+        # A busy node is expected, not a failure: PTZ still works, so keep
+        # ok=true and let the panel note who has the camera.
+        if exc.errno not in (errno.EBUSY, errno.EACCES):
+            view["ok"] = False
+
+    if include_presets:
+        view["presets"] = {str(k): v for k, v in read_presets().items()}
+    return view
+
+
+def describe(error: BaseException) -> str:
+    if isinstance(error, OSError):
+        if error.errno == errno.EACCES:
+            return "permission denied — check the udev rule"
+        if error.errno == errno.EBUSY:
+            return "device busy"
+        if error.errno == errno.ENOENT:
+            return "device disappeared"
+        return error.strerror or error.__class__.__name__
+    return str(error) or error.__class__.__name__
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_state(args) -> dict:
+    return read_state()
+
+
+def cmd_info(args) -> dict:
+    node = find_video()
+    hid = find_hidraw()
+    view = {
+        "ok": bool(node or hid),
+        "present": bool(node or hid),
+        "video": node,
+        "hidraw": hid,
+        "videoNodes": video_capture_nodes(),
+        # One file holds both framing presets and image profiles; the name is
+        # kept for compatibility with anything already reading it.
+        "presetStore": state_path(),
+    }
+    if not view["present"]:
+        view["error"] = "no-camera"
+        return view
+    if hid:
+        # ASCII build identifier. Read for display only; nothing keys off it.
+        reply = query(hid, [0x09, 0x01, 0x00, 0x03])
+        if reply and len(reply) > 8:
+            length = reply[5]
+            text = reply[8 : 8 + length] if length else reply[8:]
+            printable = "".join(
+                chr(b) for b in text if 0x20 <= b <= 0x7E
+            ).strip()
+            view["deviceId"] = printable
+        view["hidWritable"] = os.access(hid, os.W_OK)
+        view["hidReadable"] = os.access(hid, os.R_OK)
+    if node:
+        try:
+            with Camera(node) as cam:
+                cap = capability(cam.fd)
+                if cap:
+                    view.update(
+                        {"card": cap["card"], "driver": cap["driver"], "bus": cap["bus"]}
+                    )
+                controls = {}
+                for key, cid in (
+                    ("pan", CID_PAN_ABSOLUTE),
+                    ("tilt", CID_TILT_ABSOLUTE),
+                    ("zoom", CID_ZOOM_ABSOLUTE),
+                ):
+                    spec = cam.spec(cid)
+                    if spec:
+                        controls[key] = spec
+                view["controls"] = controls
+        except OSError as exc:
+            view["videoError"] = describe(exc)
+    return view
+
+
+def cmd_holders(args) -> dict:
+    """Who holds the capture stream, and nothing else.
+
+    A deliberate subset of `state`, and the reason it exists is latency. `state`
+    costs ~780 ms, nearly all of it the HID mode query and its mandatory settle
+    sleeps; scanning /proc for holders costs ~9 ms. The panel has to notice
+    another app wanting the camera *quickly* — an app that opens the node and
+    immediately tries to stream gets one shot — so it polls this while its own
+    preview is running, and leaves the full `state` on its slow interval.
+
+    Same field names and meanings as `state`, so the panel's parser is shared
+    rather than duplicated.
+    """
+    node = find_video()
+    if not node:
+        return {"ok": False, "present": False, "error": "no-camera",
+                "streaming": False, "streamUsers": [], "selfStreaming": False}
+    others, ours = stream_holders(node)
+    return {
+        "ok": True,
+        "present": True,
+        "video": node,
+        "streaming": bool(others),
+        "streamUsers": [process_name(pid) for pid in others],
+        "selfStreaming": bool(ours),
+    }
+
+
+def cmd_mode(args) -> dict:
+    """Set the control mode.
+
+    Tracking is written as an explicit Standard first when the camera reports
+    privacy: the firmware ignores a privacy -> tracking transition, so without
+    the intermediate write the camera silently stays in privacy while the panel
+    shows tracking — the one disagreement that actually matters here.
+    """
+    hid = find_hidraw()
+    if not hid:
+        return {"ok": False, "error": "vendor HID interface not found", "present": False}
+    mode = args.mode
+    if mode not in MODE_VALUES:
+        return {"ok": False, "error": f"unknown mode: {mode}"}
+
+    node = find_video()
+    # Only the "another app" list: this reports whether the mode readback can be
+    # trusted, and our own preview counts for that just as much as a meeting app
+    # would — but it is reported to the panel under `selfStreaming` in state, so
+    # here the two are simply summed.
+    others, ours = stream_holders(node) if node else ([], [])
+    streaming = bool(others or ours)
+    try:
+        if mode == "tracking":
+            current, _ = read_mode(hid)
+            if current == "privacy":
+                write_reports(hid, mode_reports("standard"))
+                time.sleep(0.15)
+        write_reports(hid, mode_reports(mode))
+    except OSError as exc:
+        return {"ok": False, "error": describe(exc), "mode": None}
+
+    time.sleep(0.2)
+    confirmed, raw = read_mode(hid)
+    return {
+        "ok": True,
+        "requested": mode,
+        # Only ever report a mode the camera confirmed. Echoing the request
+        # would make the panel claim privacy is on when it may not be. Standard
+        # and Tracking read back as the ambiguous 0x03 on an idle camera, so
+        # `confirmed` is false there even though the write landed.
+        "mode": confirmed,
+        "modeRaw": raw,
+        "confirmed": confirmed == mode,
+        "privacy": confirmed == "privacy",
+        "streaming": streaming,
+    }
+
+
+def cmd_toggle_privacy(args) -> dict:
+    """Flip privacy on or off.
+
+    Off returns to Standard rather than Tracking: leaving privacy should not
+    quietly enable a camera behavior the user did not ask for.
+    """
+    hid = find_hidraw()
+    if not hid:
+        return {"ok": False, "error": "vendor HID interface not found", "present": False}
+    current, _ = read_mode(hid)
+    # Privacy reads back unambiguously even on an idle camera, so this is a real
+    # toggle rather than a guess. An unreadable mode is treated as not-private,
+    # which errs toward turning privacy ON — the safe direction when someone is
+    # reaching for the button to cover the lens.
+    target = "standard" if current == "privacy" else "privacy"
+    args.mode = target
+    return cmd_mode(args)
+
+
+def apply_ptz(cam: Camera, pan=None, tilt=None, zoom=None) -> dict:
+    """Write whichever axes were asked for and report the readback."""
+    written, failed = {}, {}
+    for key, cid, value in (
+        ("pan", CID_PAN_ABSOLUTE, pan),
+        ("tilt", CID_TILT_ABSOLUTE, tilt),
+        ("zoom", CID_ZOOM_ABSOLUTE, zoom),
+    ):
+        if value is None:
+            continue
+        spec = cam.spec(cid)
+        if not spec:
+            failed[key] = "unsupported by this camera"
+            continue
+        scale = 1 if key == "zoom" else ARCSEC_PER_DEGREE
+        target = snap(float(value) * scale, spec)
+        if cam.set(cid, target):
+            written[key] = target // scale
+        else:
+            failed[key] = "rejected by the driver"
+    return {"written": written, "failed": failed}
+
+
+def read_image(cam: Camera, curated_only: bool = False) -> list:
+    """Every image control this camera actually offers, in panel order.
+
+    A list rather than a dict because the order is editorial — it is the order
+    the panel stacks the sliders in — and a JSON object would not preserve it.
+
+    Controls the camera does not report are dropped rather than reported as
+    unsupported: the table is written for the PIXY, so a missing entry means a
+    different firmware, and a panel row that says "unsupported" helps nobody.
+    Controls with an empty range are dropped for the same reason a dead slider
+    is worse than no slider.
+    """
+    controls = []
+    for entry in IMAGE_CONTROLS:
+        if curated_only and not entry.get("curated"):
+            continue
+        spec = cam.spec(entry["cid"])
+        if not spec or spec["max"] <= spec["min"]:
+            continue
+        value = cam.get(entry["cid"])
+        if value is None:
+            continue
+        control = {
+            "key": entry["key"],
+            "label": entry["label"],
+            "type": spec["type"],
+            "min": spec["min"],
+            "max": spec["max"],
+            "step": spec["step"],
+            "default": spec["default"],
+            "value": value,
+            # Live, not inferred: the driver clears this the moment its auto
+            # partner is switched off, so the panel dims from fact rather than
+            # from its own bookkeeping.
+            "inactive": spec["inactive"],
+            "curated": bool(entry.get("curated")),
+        }
+        if entry.get("auto"):
+            control["auto"] = entry["auto"]
+        if entry.get("unit"):
+            control["unit"] = entry["unit"]
+        if spec["type"] == "menu":
+            control["options"] = cam.menu(entry["cid"], spec["min"], spec["max"])
+        controls.append(control)
+    return controls
+
+
+def apply_image(cam: Camera, values: dict, uncover: bool = False) -> dict:
+    """Write image controls and report the readback, per key.
+
+    Three passes rather than one, because an active auto control makes its manual
+    partner read-only and no single ordering is right for both directions:
+
+      - going manual (`whiteBalanceAuto=0 whiteBalance=3200`) needs the auto off
+        *before* the value, or the value is refused
+      - going auto (`whiteBalance=5000 whiteBalanceAuto=1`) needs the value
+        *before* the auto, or it is refused and the old manual value stays
+        buried, ready to reappear the next time someone switches auto off
+
+    So: partners that are reachable right now, then everything else (which is
+    where the autos flip), then any partner an auto just released. Each control
+    is written at most once.
+
+    A partner that is still held at the end is only reported as a failure when
+    the caller did not also set its auto. When both are in the batch the caller
+    has said what the auto state should be, and an unreachable partner under it
+    is the expected outcome, not an error — that is what makes loading a profile
+    saved in auto mode succeed cleanly.
+
+    `uncover` handles the one case where that is not good enough: a reset has to
+    reach a value sitting under an auto that was already on and stays on, or the
+    old value lurks until the next time that auto is switched off. With it, such a
+    partner gets its auto dropped, the value written, and the auto restored. That
+    is three extra writes and a visible re-converge, which is why it is off by
+    default and on only for `--reset`, where "make everything neutral" is the
+    entire point.
+    """
+    written, failed, outcome = {}, {}, {}
+
+    def attempt(key: str) -> str:
+        entry = IMAGE_BY_KEY[key]
+        spec = cam.spec(entry["cid"])
+        if not spec:
+            return "unsupported"
+        # Checked before writing rather than after being refused: the flag is
+        # authoritative and reliable, and a write that is going to bounce is
+        # still a write to a live camera.
+        if entry.get("auto") and spec["inactive"]:
+            return "held"
+        target = snap(values[key], spec)
+        if not cam.set(entry["cid"], target):
+            return "rejected"
+        # Record what the camera settled on, not what was asked for. Out-of-range
+        # writes clamp silently on this device, so the readback is the only honest
+        # answer — and it is what the panel's slider should show.
+        readback = cam.get(entry["cid"])
+        written[key] = readback if readback is not None else target
+        return "done"
+
+    ordered = [c["key"] for c in IMAGE_CONTROLS if c["key"] in values]
+    dependent = [k for k in ordered if IMAGE_BY_KEY[k].get("auto")]
+
+    for key in dependent:
+        outcome[key] = attempt(key)
+    for key in ordered:
+        if key not in outcome:
+            outcome[key] = attempt(key)
+    for key in dependent:
+        if outcome[key] == "held":
+            outcome[key] = attempt(key)
+
+    if uncover:
+        for key in dependent:
+            if outcome[key] != "held":
+                continue
+            holder = IMAGE_BY_KEY[IMAGE_BY_KEY[key]["auto"]]
+            was = cam.get(holder["cid"])
+            if was is None or not cam.set(holder["cid"], holder.get("manual", 0)):
+                continue
+            outcome[key] = attempt(key)
+            # Restore unconditionally, including when the write above failed:
+            # leaving an auto switched off because a reset went sideways would be
+            # a worse outcome than the stale value this was trying to clear.
+            cam.set(holder["cid"], was)
+
+    for key, result in outcome.items():
+        if result == "done":
+            continue
+        if result == "unsupported":
+            failed[key] = "unsupported by this camera"
+        elif result == "rejected":
+            failed[key] = "rejected by the driver"
+        else:
+            holder = IMAGE_BY_KEY[key]["auto"]
+            if holder in values:
+                continue
+            failed[key] = f"held by {IMAGE_BY_KEY[holder]['label'].lower()}"
+    return {"written": written, "failed": failed}
+
+
+def reset_targets(cam: Camera) -> dict:
+    """What `--reset` should write: every image control's driver default.
+
+    The defaults come from the driver rather than from a table here, so a reset
+    lands on what the camera itself calls neutral instead of on someone's opinion
+    from three firmware revisions ago.
+
+    Ordering is not this function's problem — `apply_image` handles the auto
+    controls turning back on and burying their partners.
+    """
+    targets = {}
+    for entry in IMAGE_CONTROLS:
+        if entry["key"] in RESET_EXCLUDE:
+            continue
+        spec = cam.spec(entry["cid"])
+        if spec and spec["max"] > spec["min"]:
+            targets[entry["key"]] = spec["default"]
+    return targets
+
+
+def with_camera(action) -> dict:
+    """Run `action` against the capture node, turning failure into data."""
+    node = find_video()
+    if not node:
+        return {"ok": False, "error": "capture node not found", "present": False}
+    try:
+        with Camera(node) as cam:
+            return action(cam)
+    except OSError as exc:
+        return {"ok": False, "error": describe(exc), "video": node}
+
+
+def cmd_ptz(args) -> dict:
+    if args.home:
+        args.pan, args.tilt = 0, 0
+    if args.pan is None and args.tilt is None and not args.nudge:
+        return {"ok": False, "error": "nothing to do: pass --pan/--tilt, --nudge, or --home"}
+
+    def action(cam: Camera) -> dict:
+        pan, tilt = args.pan, args.tilt
+        if args.nudge:
+            # Relative motion is resolved against the live position rather than
+            # tracked locally, so a nudge composes correctly with a move made
+            # from anywhere else.
+            deltas = {"left": (-1, 0), "right": (1, 0), "up": (0, 1), "down": (0, -1)}
+            dx, dy = deltas[args.nudge]
+            step = max(1, int(args.step))
+            current_pan = cam.get(CID_PAN_ABSOLUTE)
+            current_tilt = cam.get(CID_TILT_ABSOLUTE)
+            if dx and current_pan is not None:
+                pan = current_pan // ARCSEC_PER_DEGREE + dx * step
+            if dy and current_tilt is not None:
+                tilt = current_tilt // ARCSEC_PER_DEGREE + dy * step
+        result = apply_ptz(cam, pan=pan, tilt=tilt)
+        if args.settle:
+            time.sleep(PTZ_SETTLE)
+        for key, cid in (("pan", CID_PAN_ABSOLUTE), ("tilt", CID_TILT_ABSOLUTE)):
+            raw = cam.get(cid)
+            if raw is not None:
+                result[key] = raw // ARCSEC_PER_DEGREE
+        result["ok"] = not result["failed"]
+        return result
+
+    return with_camera(action)
+
+
+def cmd_zoom(args) -> dict:
+    def action(cam: Camera) -> dict:
+        result = apply_ptz(cam, zoom=args.value)
+        raw = cam.get(CID_ZOOM_ABSOLUTE)
+        if raw is not None:
+            result["zoom"] = raw
+        result["ok"] = not result["failed"]
+        return result
+
+    return with_camera(action)
+
+
+def cmd_preset(args) -> dict:
+    slot = int(args.slot)
+    if slot not in PRESET_SLOTS:
+        return {"ok": False, "error": f"preset slot must be one of {list(PRESET_SLOTS)}"}
+    slots = read_presets()
+
+    if args.action == "clear":
+        slots.pop(slot, None)
+        if not write_presets(slots):
+            return {"ok": False, "error": "could not write the preset store"}
+        return {"ok": True, "slot": slot, "cleared": True,
+                "presets": {str(k): v for k, v in slots.items()}}
+
+    if args.action == "save":
+        def save(cam: Camera) -> dict:
+            entry = {}
+            for key, cid, scale in (
+                ("pan", CID_PAN_ABSOLUTE, ARCSEC_PER_DEGREE),
+                ("tilt", CID_TILT_ABSOLUTE, ARCSEC_PER_DEGREE),
+                ("zoom", CID_ZOOM_ABSOLUTE, 1),
+            ):
+                raw = cam.get(cid)
+                if raw is None:
+                    return {"ok": False, "error": f"could not read {key}"}
+                entry[key] = raw // scale
+            slots[slot] = entry
+            if not write_presets(slots):
+                return {"ok": False, "error": "could not write the preset store"}
+            return {"ok": True, "slot": slot, "saved": entry,
+                    "presets": {str(k): v for k, v in slots.items()}}
+
+        return with_camera(save)
+
+    entry = slots.get(slot)
+    if not entry:
+        return {"ok": False, "error": "empty", "slot": slot,
+                "presets": {str(k): v for k, v in slots.items()}}
+
+    def load(cam: Camera) -> dict:
+        result = apply_ptz(cam, pan=entry["pan"], tilt=entry["tilt"], zoom=entry["zoom"])
+        result.update({"ok": not result["failed"], "slot": slot, "loaded": entry,
+                       "presets": {str(k): v for k, v in slots.items()}})
+        return result
+
+    return with_camera(load)
+
+
+def parse_assignments(pairs: list) -> tuple[dict, list]:
+    """Turn `--set KEY=VALUE` strings into {key: int}, plus a list of complaints.
+
+    Errors are collected rather than raised so one typo in a batch does not
+    discard the assignments that were fine — the panel sends several at once when
+    it recalls a profile, and dropping the whole batch over one unknown key would
+    make a profile saved by a newer build unloadable.
+    """
+    values, errors = {}, []
+    for pair in pairs or ():
+        key, _, raw = pair.partition("=")
+        key = key.strip()
+        if not _:
+            errors.append(f"{pair}: expected KEY=VALUE")
+            continue
+        if key not in IMAGE_BY_KEY:
+            errors.append(f"{key}: unknown control")
+            continue
+        try:
+            values[key] = int(round(float(raw)))
+        except ValueError:
+            errors.append(f"{key}: {raw!r} is not a number")
+    return values, errors
+
+
+def cmd_image(args) -> dict:
+    """Read every image control, or write the ones named by --set/--reset."""
+    values, errors = parse_assignments(args.set)
+    if errors and not args.force:
+        return {"ok": False, "error": "; ".join(errors)}
+
+    def action(cam: Camera) -> dict:
+        result: dict = {}
+        # Explicit --set assignments override the defaults rather than being
+        # applied after them, so `--reset --set brightness=160` means "neutral,
+        # but brighter" in one correctly ordered pass.
+        targets = {**reset_targets(cam), **values} if args.reset else values
+        if targets:
+            result = apply_image(cam, targets, uncover=args.reset)
+            result["ok"] = not result["failed"]
+        else:
+            result["ok"] = True
+        # Always the full readback, so one round trip both writes and refreshes
+        # the panel. The auto/manual `inactive` flags in particular can only be
+        # known *after* the write.
+        result["controls"] = read_image(cam, curated_only=args.curated)
+        if errors:
+            result["warnings"] = errors
+        return result
+
+    return with_camera(action)
+
+
+def cmd_profile(args) -> dict:
+    """Save, load, list, or clear a named image profile."""
+    profiles = read_profiles()
+
+    if args.action == "list":
+        return {"ok": True, "profiles": profiles}
+
+    name = (args.name or "").strip()
+    if not name:
+        return {"ok": False, "error": "a profile name is required"}
+
+    if args.action == "clear":
+        if name not in profiles:
+            return {"ok": False, "error": "no such profile", "name": name,
+                    "profiles": profiles}
+        profiles.pop(name)
+        if not write_profiles(profiles):
+            return {"ok": False, "error": "could not write the profile store"}
+        return {"ok": True, "name": name, "cleared": True, "profiles": profiles}
+
+    if args.action == "save":
+        def save(cam: Camera) -> dict:
+            # Everything readable, curated or not: a profile that captured only
+            # the panel's front page would silently fail to restore an exposure
+            # someone set behind the cog, which is the case profiles exist for.
+            entry = {c["key"]: c["value"] for c in read_image(cam)}
+            if not entry:
+                return {"ok": False, "error": "no image controls to save"}
+            profiles[name] = entry
+            if not write_profiles(profiles):
+                return {"ok": False, "error": "could not write the profile store"}
+            return {"ok": True, "name": name, "saved": entry, "profiles": profiles}
+
+        return with_camera(save)
+
+    entry = profiles.get(name)
+    if not entry:
+        return {"ok": False, "error": "no such profile", "name": name,
+                "profiles": profiles}
+
+    def load(cam: Camera) -> dict:
+        result = apply_image(cam, entry)
+        result.update({"ok": not result["failed"], "name": name, "loaded": entry,
+                       "profiles": profiles,
+                       "controls": read_image(cam)})
+        return result
+
+    return with_camera(load)
+
+
+# ---------------------------------------------------------------- entry point
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pixy", description="Control an EMEET PIXY webcam."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_state = sub.add_parser("state", help="read the camera's current state")
+    p_state.set_defaults(fn=cmd_state)
+
+    p_info = sub.add_parser("info", help="device identity, nodes, and control ranges")
+    p_info.set_defaults(fn=cmd_info)
+
+    p_holders = sub.add_parser(
+        "holders", help="who holds the capture stream (cheap; no HID query)"
+    )
+    p_holders.set_defaults(fn=cmd_holders)
+
+    p_mode = sub.add_parser("mode", help="set the control mode")
+    p_mode.add_argument("mode", choices=sorted(MODE_VALUES), help="standard, tracking, or privacy")
+    p_mode.set_defaults(fn=cmd_mode)
+
+    p_privacy = sub.add_parser("privacy", help="toggle privacy on/off")
+    p_privacy.set_defaults(fn=cmd_toggle_privacy)
+
+    p_ptz = sub.add_parser("ptz", help="pan and tilt")
+    p_ptz.add_argument("--pan", type=float, metavar="DEG", help="absolute pan in degrees")
+    p_ptz.add_argument("--tilt", type=float, metavar="DEG", help="absolute tilt in degrees")
+    p_ptz.add_argument("--nudge", choices=("left", "right", "up", "down"),
+                       help="move relative to the current position")
+    p_ptz.add_argument("--step", type=float, default=5, metavar="DEG",
+                       help="degrees per --nudge (default 5)")
+    p_ptz.add_argument("--home", action="store_true", help="recenter to 0, 0")
+    p_ptz.add_argument("--settle", action="store_true",
+                       help="wait for the motors before reading back")
+    p_ptz.set_defaults(fn=cmd_ptz)
+
+    p_zoom = sub.add_parser("zoom", help="set zoom")
+    p_zoom.add_argument("value", type=float, metavar="LEVEL", help="100-150")
+    p_zoom.set_defaults(fn=cmd_zoom)
+
+    p_preset = sub.add_parser("preset", help="save, load, or clear a PTZ preset")
+    p_preset.add_argument("action", choices=("save", "load", "clear"))
+    p_preset.add_argument("slot", type=int, help="slot 1-3")
+    p_preset.set_defaults(fn=cmd_preset)
+
+    p_image = sub.add_parser("image", help="read or set image controls")
+    p_image.add_argument("--set", action="append", metavar="KEY=VALUE",
+                         help="set one control; repeatable. "
+                              f"Keys: {', '.join(c['key'] for c in IMAGE_CONTROLS)}")
+    p_image.add_argument("--reset", action="store_true",
+                         help="restore every image control to the driver's default")
+    p_image.add_argument("--curated", action="store_true",
+                         help="report only the controls the panel shows up front")
+    p_image.add_argument("--force", action="store_true",
+                         help="apply the valid assignments even if others are bad")
+    p_image.set_defaults(fn=cmd_image)
+
+    p_profile = sub.add_parser("profile", help="save, load, list, or clear an image profile")
+    p_profile.add_argument("action", choices=("save", "load", "list", "clear"))
+    p_profile.add_argument("name", nargs="?", help="profile name (not needed for list)")
+    p_profile.set_defaults(fn=cmd_profile)
+
+    p_preview = sub.add_parser(
+        "preview", help="stream the camera as ASCII frames (opens the video stream)"
+    )
+    p_preview.add_argument("--columns", type=int, default=60, metavar="N",
+                           help="output width in characters (default 60)")
+    p_preview.add_argument("--rows", type=int, default=0, metavar="N",
+                           help="output height in characters (default: from --columns, aspect-correct)")
+    p_preview.add_argument("--fps", type=float, default=6, metavar="N",
+                           help="frames per second, 0 for unthrottled (default 6)")
+    p_preview.add_argument("--frames", type=int, default=0, metavar="N",
+                           help="stop after N frames, 0 to run until killed")
+    p_preview.add_argument("--warmup", type=int, default=3, metavar="N",
+                           help="frames to discard while exposure settles (default 3)")
+    p_preview.add_argument("--blocks", action="store_true",
+                           help="render with block shades instead of ASCII")
+    p_preview.add_argument("--halfblocks", action="store_true",
+                           help="half-block render: square pixels, double detail")
+    p_preview.add_argument("--invert", action="store_true",
+                           help="swap light and dark, for light-on-dark terminals")
+    p_preview.add_argument("--text", action="store_true",
+                           help="print plain text frames instead of JSON lines")
+    p_preview.set_defaults(fn=cmd_preview, streams=True)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = args.fn(args)
+    except KeyboardInterrupt:
+        # Stopping a preview with Ctrl-C is the normal way to end it, not a
+        # fault, so it exits quietly rather than printing an error frame.
+        return 0
+    except Exception as exc:  # noqa: BLE001 - last line of defense
+        # The panel parses stdout as JSON unconditionally. An unhandled
+        # traceback on stderr with empty stdout would render as a mystery blank
+        # widget, so every failure leaves as a JSON object.
+        result = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+    # Streaming commands print their own frames as they arrive and return None;
+    # printing again here would append a stray `null` to their output.
+    if result is not None:
+        json.dump(result, sys.stdout)
+        sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
