@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "id": "nille.emeet-pixy",
+  "name": "EMEET PIXY",
+  "version": "1.0.0",
+  "author": "nille",
+  "license": "MIT",
+  "description": "EMEET PIXY webcam control: privacy, AI tracking, pan/tilt/zoom, microphone, image settings, and framing presets.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "PIXY",
+    "description": "Close the lens, mute the mic, switch AI tracking on or off, aim the camera, adjust the picture, and recall framing presets.",
+    "category": "System",
+    "aliases": ["emeet", "pixy", "webcam", "camera", "ptz", "mic", "microphone",
+                "brightness", "contrast", "exposure", "white balance"],
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "defaults": {
+      "refreshIntervalSec": 10,
+      "ptzStep": 5,
+      "hideWhenAbsent": false,
+      "preview": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 3600,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "How often to re-read camera state while the panel is open."
+      },
+      {
+        "key": "ptzStep",
+        "type": "integer",
+        "label": "Pan/tilt step (degrees)",
+        "min": 1,
+        "max": 45,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "How far one arrow press on the jog pad moves the camera."
+      },
+      {
+        "key": "hideWhenAbsent",
+        "type": "boolean",
+        "label": "Hide when no camera found",
+        "defaultValue": false,
+        "description": "Remove the bar icon entirely when the camera is unplugged, instead of showing a dimmed one."
+      },
+      {
+        "key": "preview",
+        "type": "boolean",
+        "label": "Show video preview",
+        "defaultValue": true,
+        "description": "Show a small live preview while the panel is open. Only one app can capture at a time, so the preview yields automatically to any app already using the camera. Turn it off to keep the camera free for other apps entirely. The switch on the panel's FRAMING header sets this same value, so either place works."
+      }
+    ]
+  }
+}
