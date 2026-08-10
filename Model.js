@@ -809,18 +809,6 @@ function controlValues(controls) {
   return out
 }
 
-function curatedControls(controls) {
-  return (Array.isArray(controls) ? controls : []).filter(function(c) {
-    return c.curated
-  })
-}
-
-function advancedControls(controls) {
-  return (Array.isArray(controls) ? controls : []).filter(function(c) {
-    return !c.curated
-  })
-}
-
 // Whether a control's row should be dimmed and its slider inert.
 //
 // Read from the driver's own flag rather than inferred from the auto switch's

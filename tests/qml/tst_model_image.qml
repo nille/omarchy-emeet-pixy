@@ -223,13 +223,16 @@ Item {
       compare(Model.findControl(null, "brightness"), null)
     }
 
-    function test_curated_and_advanced_partition_the_list() {
+    function test_the_panel_gets_every_control_whatever_curated_says() {
+      // The field survives on the wire — `pixy image --curated` is what reads it —
+      // but the panel does not split on it any more. It showed five controls with the
+      // rest behind a cog while the section lived on a page that could not hold them
+      // all; the IMAGE tab holds all of them. So the two partition helpers are gone,
+      // and what is worth pinning is that nothing dropped a control on the way in.
       var reply = parsed({})
-      var curated = Model.curatedControls(reply.controls)
-      var advanced = Model.advancedControls(reply.controls)
-      compare(curated.length + advanced.length, reply.controls.length)
-      compare(advanced.length, 1)
-      compare(advanced[0].key, "autoExposure")
+      compare(reply.controls.length, 4)
+      compare(Model.curatedControls, undefined)
+      compare(Model.advancedControls, undefined)
     }
 
     function test_values_come_out_keyed_by_control() {
