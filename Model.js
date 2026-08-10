@@ -519,7 +519,7 @@ function pageHints(page, caps) {
     keys.push("j/k move", "h/l adjust", "1-3 recall", "s save", "x clear",
               "p privacy", "t tracking", "c recenter", "v preview")
   } else if (page === "image") {
-    keys.push("j/k move", "h/l adjust", "enter toggle", "n name", "x clear")
+    keys.push("j/k move", "h/l adjust", "enter toggle", "s name", "x clear")
   } else if (page === "mic") {
     keys.push("h/l level", "m mute")
   } else if (page === "settings") {
