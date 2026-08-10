@@ -24,9 +24,12 @@ import "../../Model.js" as Model
 
 Item {
   // A 360-wide viewport with a 336-wide slot in it, which is the real panel: the
-  // slot is the column width less its horizontal margin.
+  // slot is the column width less its horizontal margin. miniWidth is the real one
+  // too — two thirds of the panel, after *(reported)* "the preview window is too
+  // small" retired the original third.
   function view(props) {
-    var v = { width: 360, height: 620, inset: 10, miniWidth: 120, corner: "top" }
+    var v = { width: 360, height: 620, inset: 10, miniWidth: 240, corner: "top",
+              compactBelow: 200 }
     for (var k in props) v[k] = props[k]
     return v
   }
@@ -70,8 +73,8 @@ Item {
       var dock = Model.previewDock(slot({ y: -189 }), view({}))
       compare(dock.progress, 1)
       compare(dock.docked, true)
-      compare(dock.width, 120)
-      compare(dock.height, Math.round(120 * Model.PREVIEW_ASPECT))
+      compare(dock.width, 240)
+      compare(dock.height, Math.round(240 * Model.PREVIEW_ASPECT))
     }
 
     function test_the_docked_corner_is_inset_from_the_top_right() {
@@ -140,13 +143,47 @@ Item {
       verify(!dock.compact)
     }
 
-    function test_compact_arrives_before_the_picture_is_too_small_for_words() {
-      // `compact` drops the placeholder's explanatory sentence. It has to switch
-      // while the picture is still big enough to show the shorter note, or a blocked
-      // preview goes from three lines to a bare glyph in one step.
-      verify(!Model.previewDock(slot({ y: -80 }), view({})).compact)
-      verify(Model.previewDock(slot({ y: -160 }), view({})).compact)
-      verify(Model.previewDock(slot({ y: -189 }), view({})).compact)
+    function test_compact_follows_the_width_not_the_progress() {
+      // `compact` drops the placeholder's explanatory sentence, and the question it
+      // answers is "does a line of text fit" — so it is measured against the width.
+      //
+      // The distinction is the whole point of this test: at the real docked size the
+      // frame is 240 wide and fully docked, so a progress-based threshold — which is
+      // what this was before *(reported)* "the preview window is too small" — would
+      // hide a sentence that fits perfectly well.
+      var full = Model.previewDock(slot({ y: -189 }), view({}))
+      compare(full.progress, 1)
+      compare(full.width, 240)
+      verify(!full.compact, "a 240-wide frame has room for the note")
+
+      // And it does switch, when the frame really is too narrow.
+      var small = Model.previewDock(slot({ y: -189 }), view({ miniWidth: 120 }))
+      compare(small.width, 120)
+      verify(small.compact)
+    }
+
+    function test_compact_switches_at_the_threshold_it_is_given() {
+      // Either side of it, at a width the caller picked, so the comparison is the
+      // stated one rather than an inequality that happens to hold.
+      verify(Model.previewDock(slot({ y: -189 }), view({ miniWidth: 199 })).compact)
+      verify(!Model.previewDock(slot({ y: -189 }), view({ miniWidth: 200 })).compact)
+    }
+
+    function test_no_threshold_means_nothing_is_compact() {
+      // The visible failure of a missing threshold should be a clipped line, not a
+      // silently hidden explanation at every size — an omitted `compactBelow` must
+      // not read as "compact always".
+      var v = view({})
+      delete v.compactBelow
+      verify(!Model.previewDock(slot({ y: -189 }), v).compact)
+      verify(!Model.previewDock(slot({ y: 0 }), v).compact)
+    }
+
+    function test_the_picture_in_its_slot_is_never_compact() {
+      // It is wider there than anywhere else, so this is really a guard against the
+      // comparison being written the wrong way round.
+      verify(!Model.previewDock(slot({ y: 0 }), view({})).compact)
+      verify(!Model.previewDock(slot({ y: -40 }), view({})).compact)
     }
 
     // ---- no slot at all ----
@@ -159,7 +196,7 @@ Item {
       var dock = Model.previewDock(slot({ available: false, y: 0 }), view({}))
       compare(dock.progress, 1)
       verify(dock.docked)
-      compare(dock.width, 120)
+      compare(dock.width, 240)
     }
 
     function test_a_missing_slot_or_view_does_not_throw() {

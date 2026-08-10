@@ -473,6 +473,21 @@ function previewHint(state, enabled, opened, capturing) {
 // alike, so the picture never changes proportions as it moves.
 var PREVIEW_ASPECT = 9 / 16
 
+// How much of the panel's width the docked picture keeps.
+//
+// *(reported)* "the preview window is too small". It was a third, chosen on the
+// theory that the rows it floats over should stay readable — but the rows it covers
+// are the ones you are done with, and the picture is the one you are looking at. A
+// third of a 360-wide panel is 120×68, which is enough to see that something moved
+// and not enough to see *what*: a focus change or a brightness step is a few pixels
+// of difference at that size, and judging those is the entire reason it follows the
+// scroll at all.
+//
+// Two thirds instead. Still a corner picture rather than a second full preview —
+// the labels beside it are readable and the sliders it sits above are not covered,
+// since those run the panel's full width and it only takes the top strip.
+var PREVIEW_DOCK_FRACTION = 2 / 3
+
 // Where to draw the preview, given where its place in the FRAMING section
 // currently is relative to the viewport.
 //
@@ -497,7 +512,8 @@ var PREVIEW_ASPECT = 9 / 16
 // `slot` is {y, height, width, available}, where y is the frame's top in viewport
 // coordinates and `available` says whether the slot is on screen at all — the
 // sub-pages replace the panel body, so there is no frame to sit in there and the
-// preview is docked outright. `view` is {width, height, inset, miniWidth, corner}.
+// preview is docked outright. `view` is {width, height, inset, miniWidth, corner,
+// compactBelow}.
 //
 // A pure function of two rectangles: the panel binds it to the scroll position, and
 // everything about where the picture goes is decided and tested here.
@@ -534,9 +550,17 @@ function previewDock(slot, view) {
   return {
     progress: progress,
     docked: progress > 0,
-    // Past halfway the frame is too small for the placeholder's sentences, so the
-    // panel drops them and keeps the glyph. One threshold, stated here.
-    compact: progress > 0.6,
+    // Whether the placeholder has to drop its explanatory sentence and keep the
+    // glyph. Measured against the frame's actual width rather than against
+    // `progress`, because those two stopped agreeing when the docked size grew: at
+    // two thirds of the panel the fully-docked frame is wide enough for the text, so
+    // a progress threshold would hide a sentence that fits.
+    //
+    // The panel supplies the width to compare against, since what "too narrow for a
+    // sentence" means is a question about the theme's font, which Model cannot see.
+    // Absent, nothing is compact — the visible failure is a clipped line of text,
+    // which is better than silently hiding an explanation on every size.
+    compact: width < Math.max(0, Number(v.compactBelow) || 0),
     x: Math.round(inPlaceX + (dockedX - inPlaceX) * progress),
     y: Math.round(slotTop + (dockedY - slotTop) * progress),
     width: width,
