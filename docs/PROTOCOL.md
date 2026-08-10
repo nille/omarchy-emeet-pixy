@@ -30,8 +30,8 @@ what it is good at.
 
 | | Interface | Used for |
 |---|---|---|
-| UVC | V4L2 on `/dev/videoN` | pan, tilt, zoom |
-| Vendor HID | `/dev/hidrawN` | Standard / Tracking / Privacy mode |
+| UVC | V4L2 on `/dev/videoN` | pan, tilt, zoom, image controls, capture |
+| Vendor HID | `/dev/hidrawN` | mode, audio DSP, gestures, flip/rotate, focus metering, the camera's own preset slots, the idle shutter timeout |
 
 (Three, counting the microphone — but it needs no protocol work at all. See
 [The microphone is not a protocol problem](#the-microphone-is-not-a-protocol-problem).)
@@ -53,8 +53,11 @@ a UVC absolute write. Mixing the two paths permanently desynchronizes the
 readout. A panel that cannot trust its own position display is worse than one
 with a slightly smaller feature set, so the HID PTZ path is left alone.
 
-The same divergence is why presets are stored locally — see
-[Presets](#presets-are-local-on-purpose).
+This is a statement about HID *motion commands* specifically. The camera's own
+preset slots are HID and are used — see
+[The camera's own preset slots](#the-cameras-own-preset-slots) — because their
+stored coordinates turn out to be in the UVC space, so they can be recalled over
+UVC without any HID motion command being sent.
 
 ## Finding the right nodes
 
@@ -281,20 +284,58 @@ one place means no call site can get it wrong.
 ### Queries are write-then-read
 
 A vendor query writes a report and reads the reply on the same file descriptor.
-Three details are load-bearing:
+Four details are load-bearing:
 
-1. **Replies are matched, not accepted.** *(observed)* The camera also emits
-   unsolicited status reports. Taking the first thing that arrives decodes
-   another group's payload as if it were the answer. The helper matches on report
-   id and command group.
-2. **The group byte is masked with `0x1f`.** *(observed)* Replies come back with
-   high bits set in byte 1, so comparing it raw never matches.
-3. **Reads are retried, and the fd is drained first.** *(observed)* The camera
-   sometimes answers slowly enough that a single attempt with a 0.6 s timeout
-   misses the reply — and an unread reply is then drained by the *next* query, so
-   one slow answer corrupts the following one too. This is what makes an
-   unretried read look like an intermittently broken device rather than a slow
-   one. Four attempts, draining before each.
+1. **Replies echo bytes 1–3 of the request.** *(observed)* Every group in use
+   answers with the group byte in byte 1 and the two command bytes in bytes 2–3,
+   verbatim. That is what makes a reply matchable at all — the camera also emits
+   unsolicited status reports, and taking the first thing that arrives decodes
+   another group's payload as the answer.
+2. **Matching on the group alone is not enough.** *(observed, and it shipped as a
+   bug)* A group carries several commands. Group `0x05` holds both `00 03` (set
+   audio) and `00 04` (read audio), and a set is acknowledged with `0x20` where
+   the value belongs. A read issued right after a set therefore accepted the
+   set's ack as its own answer, decoded `0x20` as a mode, and reported a write
+   that had landed as failed. The helper matches the command bytes too.
+3. **The group byte is masked with `0x1f`.** *(observed)* Replies come back with
+   high bits set in byte 1 — `0x01` returns as `0x41` or `0x61` — so comparing it
+   raw never matches. The command bytes are *not* masked; they come back exactly
+   as sent.
+4. **Reads are retried, and the fd is drained first.** *(observed)* An unread
+   reply is drained by the *next* query, so one missed answer corrupts the
+   following one too. Four attempts, draining before each.
+
+### The first write on a fresh descriptor is lost
+
+*(observed)* This is the reason a query is retried at all, and it is more specific
+than "the camera answers slowly". Timed with instrumentation:
+
+| | Latency |
+|---|---|
+| Reply to a write on an already-used fd | ~30 ms |
+| Reply to the first write after `open()` | never — the write is silently dropped |
+
+So every query on a freshly opened descriptor spent a full `QUERY_TIMEOUT`
+(0.6 s) waiting for an answer to a report the camera never saw, then succeeded
+immediately on attempt two. Ten feature reads cost **8.49 s**. Sharing one
+descriptor across them costs **0.56 s** — `HidSession` exists for exactly this,
+and `pixy vendor` opens the node once for all ten. Commands that issue a single
+query gain nothing from it and do not use it.
+
+### The first config write after idle is dropped too
+
+*(observed)* Separately from the above, and not fixed by sharing a descriptor: the
+first *set* report after a period of inactivity does not take effect. The
+identical command sent immediately afterwards succeeds. Verified across audio,
+gesture, and focus metering — cold attempts report `attempts: 2`, warm ones
+`attempts: 1`.
+
+`set_and_confirm()` is the single place this is handled: every vendor setter
+writes, waits `SET_SETTLE`, reads back, and retries once if the readback
+disagrees. A setter whose write landed exits on the first pass, so the retry costs
+nothing in the normal case — and because confirmation comes from a readback rather
+than from the write returning, `confirmed: false` is a real, reportable outcome
+rather than a hidden failure.
 
 Writes of multiple reports also pause 25 ms between them: *(observed)* the camera
 acknowledges a config report before it is ready for the commit that follows, and
@@ -405,15 +446,148 @@ Tracking again afterward, confirmed by starting a stream and reading it back. No
 worked around — the alternative is refusing to reopen the lens, and a lens that
 stays shut is a worse outcome than a tracking mode that survived.
 
-## Presets are local, on purpose
+## Other vendor feature groups
 
-The camera has three of its own HID preset slots. The helper does not use them.
+Everything below speaks the same 32-byte report. Each feature has a set command
+and a read command in the same group, and the helper never trusts a write: it
+reads back through `set_and_confirm()`.
 
-*(observed)* The HID slots store positions in the HID coordinate space, which
-does not agree with the UVC space the panel drives. A slot saved by this panel
-and loaded by EMEET Studio points somewhere else, and vice versa.
+*(observed)* Group `0x04`'s read replies put the *value* at byte 9, not at the end
+of the report. Reports are zero-padded to 32 bytes, so decoding from the last byte
+always yields `0` — which looks exactly like "the feature is off" and is a live bug
+in at least one other Linux tool for this camera. `read_gesture` and `read_feature`
+read byte 9, and there are tests pinning that.
 
-Presets are instead stored as UVC triples in
+### Audio DSP mode — group `0x05`
+
+| Mode | Value | What it is |
+|---|---|---|
+| Noise cancelling | `0x01` | the default; suppresses background noise |
+| Live | `0x02` | wide-band, for music |
+| Original | `0x03` | no processing |
+
+```
+09 05 00 03 00 01 00 01 VV      # set
+09 05 00 04                     # read — mode is byte 8
+```
+
+This is DSP inside the camera, not a PipeWire filter: it survives a reboot and
+applies to every host the camera is plugged into.
+
+### Gesture control — group `0x04`, command `02 00`
+
+```
+09 04 02 00 00 02 00 02 02 EE   # set: EE = 01 on, 00 off
+09 04 02 01 00 01 00 01 02      # read — value at byte 9
+```
+
+### Image orientation — group `0x04`, command `00 08`
+
+Three independent toggles, addressed by a feature id in byte 8:
+
+| Feature | Id |
+|---|---|
+| Horizontal flip (mirror) | `0x01` |
+| Vertical flip | `0x02` |
+| Auto-rotate (portrait) | `0x04` |
+
+```
+09 04 00 08 00 02 00 02 FF EE   # set feature FF to EE
+09 04 00 07 00 01 00 01 FF      # read feature FF — value at byte 9
+```
+
+These are applied by the camera to the outgoing stream, so they affect every app
+at once — unlike a mirror applied in a meeting client's own preview.
+
+### Focus metering — group `0x04`, commands `00 01` / `00 03`
+
+| Mode | Value |
+|---|---|
+| Center | `0x00` |
+| Face | `0x01` |
+| Area | `0x02` |
+
+```
+09 04 00 01 00 05 00 05 MM XX YY 7f 7f      # stage
+09 04 00 03 00 05 00 05 MM XX YY 7f 7f      # commit
+09 04 00 02                                 # read — mode byte 8, x byte 9, y byte 10
+```
+
+*(observed)* Two writes are required. Command `00 01` stages and `00 03` commits;
+the camera does not act on `00 01` alone. EMEET Studio sends both with an identical
+payload, and so does the helper.
+
+`XX`/`YY` are the target point for `area`, 0..0x7F from the left and top. The
+trailing `7f 7f` bytes were constant in every capture and are sent verbatim.
+
+*(observed)* The x/y bytes **persist after leaving `area` mode** — the camera keeps
+the last point picked, and sending zeros with a non-area mode does not clear them.
+There is no known reset. The helper reports them alongside the mode rather than as
+state of their own, because they only mean anything in `area`.
+
+### Idle shutter timeout — group `0x02`
+
+```
+09 02 01 00 00 04 00 04 SS SS SS SS     # set: seconds, 32-bit little-endian
+09 02 01 01                             # read — seconds at bytes 8..11
+```
+
+Zero disables it. This runs **in the camera**: after N seconds with no stream the
+lens closes itself, and it stays configured across a reboot or a move to a
+different host. Nothing on this machine needs to be running for it to work, which
+is why it is worth exposing at all.
+
+## The camera's own preset slots
+
+The camera has three PTZ preset slots of its own — the ones EMEET Studio uses.
+Three things had to be established before they could be used, and the answers do
+not point the same way.
+
+**Save works, and stores UVC degrees.** *(observed)*
+
+```
+09 03 01 15 00 02 00 02 SS EE   # SS = slot 1-3, EE = 01 save, 00 erase
+09 03 01 16 00 01 00 01 SS      # read — saved flag byte 9, then <fff at bytes 10..21
+```
+
+No coordinates are sent on a save: the camera stores wherever the lens currently
+points. The stored values come back as three little-endian floats, and the first
+two are **degrees in the same space as the UVC readback** — saving at UVC
+pan = -35.0 stores -34.969. The third float was 0.0 in every reading here and in
+the reference captures, so it is not decoded. Erase is the same report with the
+enable byte at `0x00`.
+
+This corrects an earlier claim in this document, which said the slots used a
+different coordinate space. They do not. What diverges is HID *motion*, which is a
+separate thing — see [Why HID PTZ is not used](#why-hid-ptz-is-not-used).
+
+**Load does not work.** *(observed)* The vendor load command `0x18` is inert on
+this firmware. It is acknowledged with `0x20` and the lens does not move — tested
+with a stream open and Standard mode set, comparing averaged frames before and
+after against a calibrated baseline:
+
+| Measurement | Frame difference |
+|---|---|
+| Noise floor (nothing sent) | 0.24 |
+| A known 80° UVC pan | 56.08 |
+| After a preset load | 0.35 |
+
+The calibration leg is the point of that table. An earlier run of the same test was
+inconclusive because the noise floor came out higher than the signal, and a null
+result is worth nothing until the detector has been shown to detect something.
+
+**So load is synthesized.** The helper reads the slot's stored degrees over HID and
+drives the lens there over **UVC**. No HID motion command is ever sent, so the
+position readback stays truthful — which is the one thing using the vendor load
+command could not have given even if it worked.
+
+### Framing presets: local store, mirrored to the camera
+
+The local store remains the authority, and the reason is zoom: the camera's slots
+hold pan and tilt only. A preset kept solely in the camera would silently forget
+the zoom level it was saved at.
+
+Presets are stored as UVC triples in
 `$XDG_STATE_HOME/omarchy-emeet-pixy/presets.json` (defaulting to
 `~/.local/state/...`):
 
@@ -424,14 +598,63 @@ Presets are instead stored as UVC triples in
 Unrecognized top-level keys are ignored on read, so a future `version` field can
 be added without invalidating existing stores.
 
-Save and load are then exact inverses, which is the only preset behavior worth
-shipping. The cost is that presets are per-machine and invisible to the vendor
-app; that trade is deliberate.
+`preset save` then mirrors the slot into the camera's slot of the same number, and
+`preset clear` erases it, so a preset made here is visible to EMEET Studio and
+survives a reboot. The mirror is best-effort and deliberately never fatal: it runs
+*after* the local write, and a camera with no writable `hidraw` — the ordinary
+state of one whose udev rule is not installed — saves locally and reports
+`native: null`. `--local` skips the mirror entirely.
+
+Save and load remain exact inverses, because that property comes from the local
+file rather than from the camera.
 
 Reads are defensive — a malformed store, an out-of-range slot, a half-written
 entry, or a non-numeric value is dropped rather than rendered as a preset that
 cannot be recalled. Writes go through a temp file and a rename so an interrupted
 save cannot corrupt the store.
+
+## Format enumeration
+
+`pixy formats` lists what the camera advertises, which is `v4l2-ctl
+--list-formats-ext` without needing `v4l-utils` installed. Three nested
+index-driven ioctls, each terminated by `EINVAL` rather than by a count:
+
+```
+VIDIOC_ENUM_FMT → VIDIOC_ENUM_FRAMESIZES → VIDIOC_ENUM_FRAMEINTERVALS
+```
+
+*(observed)* On this camera: MJPG at 3840×2160@30, 2560×1440@30, 1920×1080@60/30,
+1280×720@60/30 and below; YUYV only at 640×480 and 640×360. That asymmetry is why
+the terminal preview is 640×480 and why `snapshot` asks for MJPEG.
+
+**The union padding trap.** `v4l2_frmsizeenum` and `v4l2_frmivalenum` each end in a
+union whose largest arm is bigger than the discrete arm being decoded. Padding for
+the discrete arm alone under-allocates by 16 bytes, and the symptom is
+`SystemError: buffer overflow` from `fcntl.ioctl` — which names neither the struct
+nor the field. As with `v4l2_buffer`, the size is encoded in the ioctl number, so
+`struct.calcsize(fmt) == (ioctl >> 16) & 0x3fff` catches it without hardware, and
+the tests assert it for all three.
+
+Setting a format is deliberately **not** implemented. A format is not a camera
+setting — it belongs to whoever holds the stream, so writing one here would apply
+to this process's own capture and vanish when it exits. The useful thing to ship is
+the list: it tells you what to ask your meeting app for.
+
+## Snapshots
+
+`pixy snapshot` writes a full-resolution still, and the whole trick is that it
+needs no image library. *(observed)* An MJPEG frame off this camera is a complete
+JPEG file — SOI marker and all — so a 4K still is the mmap'd buffer written to disk
+verbatim. No encoder, no decoder, nothing outside the standard library. The frame
+is checked for the `ff d8` SOI before it is written, because a `.jpg` holding
+something else is worse than no file at all.
+
+Warmup frames are discarded first: the frames immediately after `STREAMON` are dark
+or half-exposed, and unlike a preview a snapshot has no later frame to redeem it.
+
+This takes the stream, so it fails with `EBUSY` during a call. That is reported as
+data rather than worked around — there is no way to grab a frame from a stream
+someone else holds.
 
 ## Permissions
 
@@ -452,9 +675,12 @@ error text names the udev rule directly instead of saying "permission denied".
 The parts most likely to break, roughly in order: the `0x03` ambiguity and the
 idle camera refusing mode writes (both read like bugs and may get fixed — and if
 they are, `Model.modeWritable` starts dimming chips that would now work, so it is
-the first thing to revisit), the privacy → tracking transition being ignored, and
-the doubled length byte. The control mode values and the report id are the parts
-that feel structural.
+the first thing to revisit), the inert preset-load command `0x18` (if a firmware
+update makes it work, the synthesized UVC load is still the better path, because it
+keeps the position readback honest), the dropped first write after idle, the
+privacy → tracking transition being ignored, and the doubled length byte. The
+command groups, the mode values, and the report id are the parts that feel
+structural.
 
 The capture path is the least likely to move, because none of it is EMEET's — the
 struct layouts belong to the kernel's UAPI and the ioctl numbers are stable by

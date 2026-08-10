@@ -275,6 +275,128 @@ function streamLabel(state) {
   return "In use by " + users.length + " apps"
 }
 
+// ---------------------------------------------------------------- call automation
+//
+// "A call started" and "a call ended" are already known here: the panel polls who
+// holds the capture stream so it can yield its own preview, and an app holding the
+// stream *is* a call. So automation needs no new detection mechanism, no window
+// title matching, and no list of meeting apps to keep up to date — a browser tab,
+// a native client, and OBS all count identically, which is the right answer.
+//
+// The whole feature is therefore two pure functions plus a Panel property that
+// remembers what it changed. Everything reversible is reversed on the way out;
+// anything that was already in the wanted state is left alone, so ending a call
+// cannot undo something the user set by hand.
+
+var CALL_ACTIONS = ["tracking", "unmute", "openLens"]
+
+// The same three actions as the panel draws them: in the order they are applied,
+// each with the settings key that persists it. Separate from CALL_ACTIONS because
+// that list is the plan's vocabulary and this is presentation — and because the
+// order differs on purpose, openLens first for the reason callStartPlan gives.
+var CALL_ACTION_META = [
+  { key: "openLens", setting: "callOpenLens", label: "Open the lens",
+    note: "Uncovers the camera when a call starts, and closes it again after." },
+  { key: "tracking", setting: "callTracking", label: "Turn tracking on",
+    note: "Follows you during the call, then restores the previous mode." },
+  { key: "unmute", setting: "callUnmute", label: "Unmute the microphone",
+    note: "Only if it was muted — a mic left on is left alone." }
+]
+
+// Is this transition a call starting or ending?
+//
+// `selfStreaming` is excluded deliberately: the panel's own preview holds the
+// stream, so counting it would fire automation every time the popout opened. Only
+// `streaming` — other apps — is a call.
+function callEdge(wasStreaming, isStreaming) {
+  if (!wasStreaming && isStreaming) return "start"
+  if (wasStreaming && !isStreaming) return "end"
+  return ""
+}
+
+// What to do about a call starting, given which actions are enabled and what the
+// camera is currently doing.
+//
+// Returns an object of the changes to make, and — the part that matters — a
+// `restore` object recording only what was actually changed. Ending the call
+// replays `restore`, so a camera that was already unmuted and already tracking
+// comes out of the call exactly as it went in. Without that bookkeeping, "end of
+// call" would mute a mic the user had deliberately left on.
+//
+// `actions` is the enabled set as {tracking, unmute, openLens}. `now` is
+// {privacy, mode, muted} — the live camera and mic state.
+function callStartPlan(actions, now) {
+  var opts = actions || {}
+  var state = now || {}
+  var plan = { restore: {} }
+
+  // Opening the lens comes first and is its own action, because it is the one
+  // that makes the difference between "my camera did not work" and everything
+  // else on this list. A call joined with the lens closed shows a black frame.
+  if (opts.openLens && state.privacy) {
+    plan.privacy = false
+    plan.restore.privacy = true
+  }
+
+  // Tracking only when the mode is known. An unknown mode means the camera would
+  // not say whether it is already tracking, and restoring to a guess at the end
+  // of the call is worse than not touching it — see the 0x03 ambiguity.
+  if (opts.tracking && state.mode && state.mode !== "tracking") {
+    plan.mode = "tracking"
+    plan.restore.mode = state.mode
+  }
+
+  if (opts.unmute && state.muted === true) {
+    plan.muted = false
+    plan.restore.muted = true
+  }
+
+  return plan
+}
+
+// The inverse: what to undo when the call ends, from the `restore` recorded at
+// the start. Only keys that were changed appear, so this is a no-op for anything
+// the user had already set the way the call wanted it.
+//
+// Privacy is restored *last* in the caller's ordering for the same reason it is
+// applied first: closing the lens while also writing a mode makes the mode write
+// land on a camera that is going into privacy, and the firmware ignores
+// Standard/Tracking writes made from privacy.
+function callEndPlan(restore) {
+  var saved = restore || {}
+  var plan = {}
+  if (saved.mode !== undefined) plan.mode = saved.mode
+  if (saved.muted !== undefined) plan.muted = saved.muted
+  if (saved.privacy !== undefined) plan.privacy = saved.privacy
+  return plan
+}
+
+// Whether a plan asks for anything at all, so the caller can skip the work and
+// the log line rather than writing an empty change.
+function planIsEmpty(plan) {
+  if (!plan) return true
+  for (var key in plan) {
+    if (key === "restore") continue
+    return false
+  }
+  return true
+}
+
+// One line describing what automation did, for the panel's status area. Written
+// here rather than in the Panel so the wording is testable and so the panel does
+// not assemble prose inline.
+function callActionLabel(plan) {
+  if (planIsEmpty(plan)) return ""
+  var parts = []
+  if (plan.privacy === false) parts.push("opened the lens")
+  if (plan.privacy === true) parts.push("closed the lens")
+  if (plan.mode === "tracking") parts.push("tracking on")
+  else if (plan.mode) parts.push(plan.mode)
+  if (plan.muted === false) parts.push("unmuted")
+  if (plan.muted === true) parts.push("muted")
+  return parts.join(", ")
+}
+
 // ---------------------------------------------------------------- preview
 //
 // Only one process can hold the V4L2 stream at a time, and that cuts both ways:
@@ -292,8 +414,14 @@ function streamLabel(state) {
 // Why the preview is not showing, or "" when it is (or should be) running.
 // Ordered by precedence, most decisive first: a reason that makes the preview
 // impossible outranks one that merely makes it unwanted.
-function previewBlocker(state, enabled, opened) {
+//
+// `capturing` is our own snapshot: taking a still needs the stream the preview is
+// holding, so the preview yields to it exactly as it yields to another app. It
+// outranks everything but the camera being absent, because it is the one blocker
+// the user just asked for.
+function previewBlocker(state, enabled, opened, capturing) {
   if (!state || !state.present) return "no-camera"
+  if (capturing) return "capturing"
   if (!enabled) return "disabled"
   if (state.privacy) return "privacy"
   // Another app is on the camera, so we get out of the way.
@@ -315,9 +443,10 @@ function previewBlocker(state, enabled, opened) {
 
 // The blocker rendered for the placeholder inside the preview frame. Kept short
 // — it sits in a small box — and paired with previewHint for the explanation.
-function previewNote(state, enabled, opened) {
-  var reason = previewBlocker(state, enabled, opened)
+function previewNote(state, enabled, opened, capturing) {
+  var reason = previewBlocker(state, enabled, opened, capturing)
   if (reason === "no-camera") return "No camera"
+  if (reason === "capturing") return "Taking a snapshot"
   if (reason === "disabled") return "Preview off"
   if (reason === "privacy") return "Lens closed"
   if (reason === "busy") return streamLabel(state) || "In use"
@@ -327,8 +456,9 @@ function previewNote(state, enabled, opened) {
 // The second line, which says what the note implies. Only where it is not
 // obvious: "Lens closed" needs no gloss, but "In use by zoom" does — without it
 // a blank preview during a call reads as this widget being broken.
-function previewHint(state, enabled, opened) {
-  var reason = previewBlocker(state, enabled, opened)
+function previewHint(state, enabled, opened, capturing) {
+  var reason = previewBlocker(state, enabled, opened, capturing)
+  if (reason === "capturing") return "The preview yields the camera for a moment."
   if (reason === "busy") return "Only one app can capture at a time. Controls still work."
   // Not currently rendered — the panel hides the whole frame when the preview is
   // off rather than leaving a placeholder — but kept correct and kept here so the
@@ -337,6 +467,81 @@ function previewHint(state, enabled, opened) {
   // the FRAMING header, a few lines above where this would appear.
   if (reason === "disabled") return "Turn it back on with the switch above."
   return ""
+}
+
+// 16:9, the only shape the preview is ever drawn in — in its frame and docked
+// alike, so the picture never changes proportions as it moves.
+var PREVIEW_ASPECT = 9 / 16
+
+// Where to draw the preview, given where its place in the FRAMING section
+// currently is relative to the viewport.
+//
+// *(reported)* The panel is taller than the box that holds it, so adjusting almost
+// anything scrolls the preview off the top — and the picture is exactly what half
+// these controls are for. Mirroring, focus, brightness and the image sliders are
+// all "watch it change" settings, and watching it change meant scrolling up and
+// losing the control.
+//
+// So the preview leaves the scrolling flow and floats above it: it draws in its own
+// frame while that frame is on screen, and shrinks into a small picture-in-picture
+// in a corner of the viewport once the frame has scrolled away. `progress` is the
+// interpolation between those two, driven by how far the frame has gone past the
+// top edge, which is what makes it read as the same object moving rather than a
+// second preview appearing.
+//
+// The alternative — pinning it under the hero permanently — was rejected because it
+// spends a third of the panel on the picture even on the pages where the picture is
+// not the point. The docked size is a third of the width, which is small enough to
+// leave the labels under it readable and large enough to see a mirror flip.
+//
+// `slot` is {y, height, width, available}, where y is the frame's top in viewport
+// coordinates and `available` says whether the slot is on screen at all — the
+// sub-pages replace the panel body, so there is no frame to sit in there and the
+// preview is docked outright. `view` is {width, height, inset, miniWidth, corner}.
+//
+// A pure function of two rectangles: the panel binds it to the scroll position, and
+// everything about where the picture goes is decided and tested here.
+function previewDock(slot, view) {
+  var v = view || {}
+  var viewWidth = Math.max(0, Number(v.width) || 0)
+  var viewHeight = Math.max(0, Number(v.height) || 0)
+  var inset = Math.max(0, Number(v.inset) || 0)
+  var mini = Math.max(0, Number(v.miniWidth) || 0)
+
+  var s = slot || {}
+  var slotWidth = Math.max(0, Number(s.width) || 0)
+  var slotTop = Number(s.y)
+  if (!isFinite(slotTop)) slotTop = 0
+
+  // Docked outright when there is no frame on screen to be in.
+  var progress = 1
+  if (s.available) {
+    // The travel is the frame's own height, so the shrink finishes exactly as the
+    // frame finishes leaving — any other distance makes the two look unrelated.
+    var travel = Math.max(1, Number(s.height) || 1)
+    progress = clamp(-slotTop / travel, 0, 1)
+  }
+
+  var width = Math.round(slotWidth + (mini - slotWidth) * progress)
+  var height = Math.round(width * PREVIEW_ASPECT)
+
+  // Both ends computed at the *current* width rather than at their own, so the
+  // picture slides and shrinks together instead of drifting out of its own corner.
+  var inPlaceX = (viewWidth - width) / 2
+  var dockedX = viewWidth - inset - width
+  var dockedY = v.corner === "bottom" ? viewHeight - inset - height : inset
+
+  return {
+    progress: progress,
+    docked: progress > 0,
+    // Past halfway the frame is too small for the placeholder's sentences, so the
+    // panel drops them and keeps the glyph. One threshold, stated here.
+    compact: progress > 0.6,
+    x: Math.round(inPlaceX + (dockedX - inPlaceX) * progress),
+    y: Math.round(slotTop + (dockedY - slotTop) * progress),
+    width: width,
+    height: height
+  }
 }
 
 // Codepoints are md-eye (U+F0208) and md-eye_off (U+F0209), verified present in
@@ -364,8 +569,30 @@ function previewIcon(enabled) {
 // `{}` is the selector: no selector means the setting applies to every instance of
 // this widget, which is right because there is one camera.
 function previewSettingArgs(moduleName, enabled) {
+  return boolSettingArgs(moduleName, "preview", enabled)
+}
+
+// The same write for any boolean setting the panel owns a switch for — the three
+// call-automation actions. Shares previewSettingArgs' contract, including the
+// bare-word JSON: a quoted "false" is a truthy string and would silently leave
+// the setting on.
+function boolSettingArgs(moduleName, key, enabled) {
   return ["omarchy-shell", "-q", "shell", "setBarWidget",
-          moduleName, "preview", enabled ? "true" : "false", "{}"]
+          moduleName, String(key), enabled ? "true" : "false", "{}"]
+}
+
+// An on/off word from the IPC, where every argument arrives as a string. Only the
+// off words are listed, and anything else — including an omitted argument, which
+// arrives as "" — means on. That asymmetry is on purpose: `pixy-ipc gesture` with
+// nothing after it reads as "turn gestures on", and a typo that turned something
+// *off* would be the surprising direction to fail in.
+//
+// Deliberately no "toggle": the panel would have to know the current value, and
+// these settings are read on demand rather than polled — so a keybinding bound to
+// a toggle would flip whatever the last read said, which may be nothing at all.
+function boolArg(word) {
+  var text = String(word === undefined || word === null ? "" : word).trim().toLowerCase()
+  return !(text === "off" || text === "false" || text === "0" || text === "no")
 }
 
 // ---------------------------------------------------------------- image controls
@@ -878,6 +1105,410 @@ function isCentered(state) {
   return !!state && state.pan === 0 && state.tilt === 0
 }
 
+// ---------------------------------------------------------------- vendor features
+//
+// The settings that live in the camera's own firmware rather than in V4L2: the
+// microphone's DSP chain, gesture control, the image-orientation flips, what the
+// autofocus aims at, and the idle shutter timeout. All of them are vendor HID
+// reports, all of them survive a reboot and a different host, and none of them is
+// reachable through any standard interface — which is the whole reason they are
+// worth carrying here rather than leaving to the vendor app.
+//
+// They are read in one call (`pixy vendor`) and shown on their own page, for one
+// reason: each is a separate HID query with its own retry budget, so folding them
+// into `state` would multiply the cost of the panel's most frequent call for
+// values that one page ever shows.
+//
+// A feature the camera did not answer for stays null rather than becoming false.
+// "Off" and "could not read" are different things, and rendering the second as
+// the first is how a panel ends up lying about hardware.
+
+// Microphone DSP chain. Three named processing modes, and the only microphone
+// control the firmware exposes — level and mute are PipeWire, further up.
+var AUDIO_MODES = [
+  { value: "noise-cancel", label: "Noise cancelling" },
+  { value: "live", label: "Live" },
+  { value: "original", label: "Original" }
+]
+
+// What the autofocus aims at. Independent of the UVC focus controls, which choose
+// auto versus manual rather than *where*.
+var FOCUS_TARGETS = [
+  { value: "center", label: "Center" },
+  { value: "face", label: "Face" },
+  { value: "area", label: "Spot" }
+]
+
+// The selected-area grid, origin top left. Mirrors METERING_MAX in the helper,
+// which clamps again before anything reaches the wire.
+var METERING_MAX = 127
+
+// Idle shutter timeout, in seconds, as choices rather than a free number. The
+// firmware takes any 32-bit value, but a spinner for "how long before the lens
+// closes itself" invites a number nobody wants — the useful answers are a handful
+// of durations and off.
+var AUTO_PRIVACY_CHOICES = [
+  { seconds: 0, label: "Off" },
+  { seconds: 60, label: "1 min" },
+  { seconds: 300, label: "5 min" },
+  { seconds: 900, label: "15 min" }
+]
+
+// The orientation toggles, in the order they are drawn. Manual 90° rotation is
+// deliberately absent: EMEET Studio's rotate buttons produce no USB traffic at
+// all, so rotation there is a host-side transform of its own preview rather than
+// a camera setting, and there is nothing to write.
+var FEATURE_TOGGLES = [
+  { key: "flipHorizontal", label: "Mirror horizontally",
+    note: "Flips the image left to right, in the camera." },
+  { key: "flipVertical", label: "Mirror vertically",
+    note: "Flips the image top to bottom, in the camera." },
+  { key: "autoRotate", label: "Auto-rotate",
+    note: "Lets the camera correct the image when it is mounted sideways." }
+]
+
+function parseVendor(raw) {
+  var text = String(raw || "").trim()
+  if (!text) return vendorReply("no output")
+  var data
+  try {
+    data = JSON.parse(text)
+  } catch (e) {
+    return vendorReply("invalid helper output")
+  }
+  if (!data || typeof data !== "object") return vendorReply("invalid helper output")
+
+  var features = {}
+  var raw_features = (data.features && typeof data.features === "object") ? data.features : {}
+  for (var i = 0; i < FEATURE_TOGGLES.length; i++) {
+    var key = FEATURE_TOGGLES[i].key
+    var value = raw_features[key]
+    features[key] = (value === true || value === false) ? value : null
+  }
+
+  var metering = null
+  if (data.metering && typeof data.metering === "object") {
+    metering = {
+      mode: FOCUS_TARGETS.some(function(t) { return t.value === data.metering.mode })
+        ? String(data.metering.mode) : null,
+      x: clamp(data.metering.x, 0, METERING_MAX),
+      y: clamp(data.metering.y, 0, METERING_MAX)
+    }
+  }
+
+  var native = {}
+  var slots = (data.nativePresets && typeof data.nativePresets === "object")
+    ? data.nativePresets : {}
+  for (var s = 0; s < PRESET_SLOTS.length; s++) {
+    var slot = PRESET_SLOTS[s]
+    var entry = slots[String(slot)]
+    native[slot] = (entry && typeof entry === "object") ? { saved: entry.saved === true } : null
+  }
+
+  return {
+    ok: data.ok !== false,
+    // `present: false` is the helper's way of saying there is no vendor HID node
+    // at all, which is the ordinary state of a camera whose udev rule is missing —
+    // a different thing from a failed read, and the only one worth instructions.
+    present: data.present !== false,
+    error: String(data.error || ""),
+    audio: AUDIO_MODES.some(function(m) { return m.value === data.audio })
+      ? String(data.audio) : null,
+    gesture: (data.gesture === true || data.gesture === false) ? data.gesture : null,
+    features: features,
+    metering: metering,
+    autoPrivacy: isFinite(Number(data.autoPrivacy)) && data.autoPrivacy !== null
+      ? Math.max(0, Math.round(Number(data.autoPrivacy))) : null,
+    nativePresets: native
+  }
+}
+
+function vendorReply(error) {
+  var features = {}
+  for (var i = 0; i < FEATURE_TOGGLES.length; i++) features[FEATURE_TOGGLES[i].key] = null
+  var native = {}
+  for (var s = 0; s < PRESET_SLOTS.length; s++) native[PRESET_SLOTS[s]] = null
+  return {
+    ok: false, present: true, error: String(error || ""),
+    audio: null, gesture: null, features: features,
+    metering: null, autoPrivacy: null, nativePresets: native
+  }
+}
+
+// Overlay the optimistic values a write is waiting on.
+//
+// Same reasoning as `imagePending` and the PTZ sliders: a vendor write costs a
+// round trip through HID with a retry budget, and a switch that stays put for
+// half a second after being clicked reads as broken. Keys are the ones the panel
+// writes — "audio", "gesture", "autoPrivacy", "focus", and any feature key.
+//
+// A copy, never a mutation: a `var` property assigned in place notifies nothing,
+// so the rows would keep showing the old value until something else changed.
+function applyVendorPending(vendor, pending) {
+  if (!vendor) return vendor
+  var next = {}
+  for (var key in vendor) next[key] = vendor[key]
+  var waiting = pending || {}
+  if (waiting.audio !== undefined) next.audio = waiting.audio
+  if (waiting.gesture !== undefined) next.gesture = waiting.gesture
+  if (waiting.autoPrivacy !== undefined) next.autoPrivacy = waiting.autoPrivacy
+  if (waiting.focus !== undefined) {
+    // The spot survives a mode change, because the camera keeps the last picked
+    // point in those bytes — so an optimistic switch to Face must not blank the
+    // coordinates the next switch back to Spot will still be using.
+    var previous = vendor.metering || { x: 0, y: 0 }
+    next.metering = {
+      mode: waiting.focus.mode,
+      x: waiting.focus.x === undefined ? previous.x : waiting.focus.x,
+      y: waiting.focus.y === undefined ? previous.y : waiting.focus.y
+    }
+  }
+  var features = {}
+  for (var f in vendor.features) features[f] = vendor.features[f]
+  for (var i = 0; i < FEATURE_TOGGLES.length; i++) {
+    var name = FEATURE_TOGGLES[i].key
+    if (waiting[name] !== undefined) features[name] = waiting[name]
+  }
+  next.features = features
+  return next
+}
+
+// Whether anything at all was read. The page shows its own "no control interface"
+// state rather than a column of rows that cannot say what they hold.
+function vendorReadable(vendor) {
+  if (!vendor) return false
+  return vendor.audio !== null || vendor.gesture !== null || vendor.metering !== null
+    || vendor.autoPrivacy !== null
+}
+
+// Why the page has nothing to show. Empty when it does.
+function vendorNote(vendor) {
+  if (!vendor) return ""
+  if (vendor.present === false)
+    return "The camera's control interface was not found. Install the udev rule — see the README."
+  if (!vendorReadable(vendor))
+    return vendor.error
+      ? vendor.error
+      : "The camera did not answer. Try again, or replug it."
+  return ""
+}
+
+function audioLabel(mode) {
+  for (var i = 0; i < AUDIO_MODES.length; i++)
+    if (AUDIO_MODES[i].value === mode) return AUDIO_MODES[i].label
+  return "Unknown"
+}
+
+// What each DSP mode is for. Worth stating on the page: the names alone do not
+// say which one to pick, and picking wrong is only audible to whoever is
+// listening — the one person who cannot tell you until afterwards.
+function audioNote(mode) {
+  if (mode === "noise-cancel")
+    return "Suppresses room noise. The default, and the right one for a call."
+  if (mode === "live")
+    return "Wider response with light processing, for music and instruments."
+  if (mode === "original")
+    return "No processing at all — the raw capsule, for recording you will edit."
+  return ""
+}
+
+function focusTargetLabel(mode) {
+  for (var i = 0; i < FOCUS_TARGETS.length; i++)
+    if (FOCUS_TARGETS[i].value === mode) return FOCUS_TARGETS[i].label
+  return "Unknown"
+}
+
+function focusNote(metering) {
+  var mode = metering ? metering.mode : null
+  if (mode === "center") return "Focuses on the middle of the frame."
+  if (mode === "face") return "Follows a face when it finds one."
+  if (mode === "area") return "Click the pad to aim the spot."
+  return ""
+}
+
+// Where the spot sits, as a fraction of the frame, so the preview can draw it
+// without knowing the grid. Null when there is no spot to draw — which includes
+// every mode but `area`, because the camera keeps the last picked point in those
+// bytes and drawing it would show a target that is not in use.
+function focusSpot(metering) {
+  if (!metering || metering.mode !== "area") return null
+  return { x: clamp(metering.x, 0, METERING_MAX) / METERING_MAX,
+           y: clamp(metering.y, 0, METERING_MAX) / METERING_MAX }
+}
+
+// A click on the preview, in 0..1 of its width and height, as grid coordinates.
+function focusPoint(fractionX, fractionY) {
+  return {
+    x: Math.round(clamp(fractionX, 0, 1) * METERING_MAX),
+    y: Math.round(clamp(fractionY, 0, 1) * METERING_MAX)
+  }
+}
+
+// The auto-privacy chips as a ButtonGroup takes them. Built here rather than in
+// the panel because ButtonGroup keys on strings and these are seconds — the
+// conversion in both directions belongs in one place, next to the list itself.
+function autoPrivacyOptions() {
+  var out = []
+  for (var i = 0; i < AUTO_PRIVACY_CHOICES.length; i++)
+    out.push({ value: String(AUTO_PRIVACY_CHOICES[i].seconds),
+               label: AUTO_PRIVACY_CHOICES[i].label })
+  return out
+}
+
+function autoPrivacyLabel(seconds) {
+  if (seconds === null || seconds === undefined) return "Unknown"
+  var n = Math.max(0, Math.round(Number(seconds) || 0))
+  for (var i = 0; i < AUTO_PRIVACY_CHOICES.length; i++)
+    if (AUTO_PRIVACY_CHOICES[i].seconds === n) return AUTO_PRIVACY_CHOICES[i].label
+  // A value set by the vendor app or by hand on the CLI, which the chips have no
+  // home for. Reported rather than rounded to the nearest chip: the camera holds
+  // what it holds, and the chips show none selected.
+  if (n % 60 === 0) return (n / 60) + " min"
+  return n + " s"
+}
+
+// How the camera's own preset slots read, for the line under the framing presets.
+// Saving a framing preset here mirrors it into the slot of the same number, so
+// this is what says whether that worked.
+function nativePresetSummary(vendor) {
+  if (!vendor || !vendor.nativePresets) return ""
+  var saved = []
+  for (var i = 0; i < PRESET_SLOTS.length; i++) {
+    var entry = vendor.nativePresets[PRESET_SLOTS[i]]
+    if (entry && entry.saved) saved.push(PRESET_SLOTS[i])
+  }
+  if (!saved.length) return "None stored in the camera"
+  if (saved.length === 1) return "Slot " + saved[0] + " stored in the camera"
+  return "Slots " + saved.join(", ") + " stored in the camera"
+}
+
+// The same slots as a plain map of slot number to true/false/null, for `state`.
+// The summary line above is prose and the page's rows are objects; a script wants
+// neither. Null stays null here too — an unread slot is not an empty one.
+function nativePresetSlots(vendor) {
+  var out = {}
+  var slots = (vendor && vendor.nativePresets) ? vendor.nativePresets : {}
+  for (var i = 0; i < PRESET_SLOTS.length; i++) {
+    var entry = slots[PRESET_SLOTS[i]]
+    out[PRESET_SLOTS[i]] = entry ? entry.saved === true : null
+  }
+  return out
+}
+
+// ---- capture formats ----
+//
+// Read-only, deliberately. A format belongs to whoever holds the stream, so
+// setting one here would apply to this process's own capture and vanish when it
+// exits. The list is the useful part: it says what to ask a meeting app for.
+
+function parseFormats(raw) {
+  var text = String(raw || "").trim()
+  if (!text) return { ok: false, error: "no output", formats: [] }
+  var data
+  try {
+    data = JSON.parse(text)
+  } catch (e) {
+    return { ok: false, error: "invalid helper output", formats: [] }
+  }
+  if (!data || typeof data !== "object")
+    return { ok: false, error: "invalid helper output", formats: [] }
+
+  var formats = []
+  var list = Array.isArray(data.formats) ? data.formats : []
+  for (var i = 0; i < list.length; i++) {
+    var f = list[i]
+    if (!f || typeof f !== "object" || !f.fourcc) continue
+    var sizes = []
+    var rawSizes = Array.isArray(f.sizes) ? f.sizes : []
+    for (var s = 0; s < rawSizes.length; s++) {
+      var size = rawSizes[s]
+      if (!size || !isFinite(Number(size.width)) || !isFinite(Number(size.height))) continue
+      var fps = []
+      var rawFps = Array.isArray(size.fps) ? size.fps : []
+      for (var n = 0; n < rawFps.length; n++)
+        if (isFinite(Number(rawFps[n]))) fps.push(Number(rawFps[n]))
+      sizes.push({ width: Number(size.width), height: Number(size.height), fps: fps })
+    }
+    formats.push({
+      fourcc: String(f.fourcc),
+      description: String(f.description || f.fourcc),
+      compressed: !!f.compressed,
+      sizes: sizes
+    })
+  }
+  return { ok: data.ok !== false && formats.length > 0,
+           error: String(data.error || ""), formats: formats }
+}
+
+// One line per format: what it is and the largest mode it offers. The full size
+// list is what `pixy formats` is for — a panel row that tried to hold ten
+// resolutions would be unreadable, and the biggest one is the question people
+// actually have.
+function formatLines(parsed) {
+  var out = []
+  var formats = (parsed && Array.isArray(parsed.formats)) ? parsed.formats : []
+  for (var i = 0; i < formats.length; i++) {
+    var f = formats[i]
+    if (!f.sizes.length) { out.push({ name: f.fourcc, detail: "no sizes reported" }); continue }
+    // The helper sorts largest first, and highest frame rate first within a size.
+    var best = f.sizes[0]
+    var detail = best.width + "×" + best.height
+    if (best.fps.length) detail += " @ " + Math.round(best.fps[0]) + " fps"
+    detail += " · " + f.sizes.length + (f.sizes.length === 1 ? " mode" : " modes")
+    out.push({ name: f.fourcc, detail: detail })
+  }
+  return out
+}
+
+// The biggest still the camera can take, which is what the snapshot button gets.
+function largestFormat(parsed) {
+  var formats = (parsed && Array.isArray(parsed.formats)) ? parsed.formats : []
+  var best = null
+  for (var i = 0; i < formats.length; i++)
+    for (var s = 0; s < formats[i].sizes.length; s++) {
+      var size = formats[i].sizes[s]
+      if (!best || size.width * size.height > best.width * best.height) best = size
+    }
+  return best
+}
+
+// ---- snapshots ----
+
+function parseSnapshot(raw) {
+  var text = String(raw || "").trim()
+  if (!text) return { ok: false, error: "no output", path: "" }
+  var data
+  try {
+    data = JSON.parse(text)
+  } catch (e) {
+    return { ok: false, error: "invalid helper output", path: "" }
+  }
+  if (!data || typeof data !== "object")
+    return { ok: false, error: "invalid helper output", path: "" }
+  return {
+    ok: data.ok === true,
+    error: String(data.error || ""),
+    busy: data.busy === true,
+    path: String(data.path || ""),
+    width: Number(data.width) || 0,
+    height: Number(data.height) || 0
+  }
+}
+
+// What to say after a snapshot. The filename rather than the whole path, because
+// the directory is the same every time and the panel is narrow — and the size,
+// because "did it save the 4K one" is the question a still raises.
+function snapshotLabel(shot) {
+  if (!shot) return ""
+  if (shot.ok) {
+    var name = shot.path.split("/").pop()
+    var size = shot.width && shot.height ? " · " + shot.width + "×" + shot.height : ""
+    return "Saved " + name + size
+  }
+  if (shot.busy) return "Another app has the camera"
+  return shot.error ? "Snapshot failed: " + shot.error : ""
+}
+
 // ---------------------------------------------------------------- helper argv
 
 // Build the helper's argument list. Centralized so the Panel never assembles
@@ -920,6 +1551,54 @@ function zoomArgs(helper, value) {
 
 function presetArgs(helper, action, slot) {
   return [helper, "preset", String(action), String(slot)]
+}
+
+// ---- vendor features ----
+//
+// One read call for all of them, because each is a separate HID query with its own
+// retry budget and folding them into `state` would multiply the cost of the
+// panel's most frequent call. Read when the tab that shows them opens.
+function vendorArgs(helper) {
+  return [helper, "vendor"]
+}
+
+function audioArgs(helper, mode) {
+  return [helper, "audio", String(mode)]
+}
+
+function gestureArgs(helper, enabled) {
+  return [helper, "gesture", enabled ? "on" : "off"]
+}
+
+function featureArgs(helper, name, enabled) {
+  return [helper, "feature", String(name), enabled ? "on" : "off"]
+}
+
+function meteringArgs(helper, mode, x, y) {
+  var argv = [helper, "metering", String(mode)]
+  if (mode === "area") {
+    argv.push("--x", String(clamp(Math.round(Number(x) || 0), 0, METERING_MAX)))
+    argv.push("--y", String(clamp(Math.round(Number(y) || 0), 0, METERING_MAX)))
+  }
+  return argv
+}
+
+function autoPrivacyArgs(helper, seconds) {
+  return [helper, "auto-privacy", String(Math.max(0, Math.round(Number(seconds) || 0)))]
+}
+
+function formatsArgs(helper) {
+  return [helper, "formats"]
+}
+
+function snapshotArgs(helper) {
+  return [helper, "snapshot"]
+}
+
+function nativePresetArgs(helper, action, slot) {
+  var argv = [helper, "native-preset", String(action)]
+  if (slot !== undefined && slot !== null) argv.push(String(slot))
+  return argv
 }
 
 // Nudge direction for an arrow key or a pad button, as the helper spells it.

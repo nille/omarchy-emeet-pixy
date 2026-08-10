@@ -75,6 +75,45 @@ Item {
       compare(Model.previewBlocker(cam({ streaming: true }), true, false), "busy")
     }
 
+    // ---- our own snapshot ----
+    //
+    // A still needs the stream the preview is holding, so `capturing` is the one
+    // blocker the panel imposes on itself. Its precedence is the interesting part:
+    // second only to a missing camera, because the user just asked for it.
+
+    function test_capturing_blocks_the_preview() {
+      compare(Model.previewBlocker(cam({}), true, true, true), "capturing")
+    }
+
+    function test_capturing_outranks_disabled_privacy_and_busy() {
+      // All three would be true of a camera in privacy that someone else holds with
+      // the preview switched off — and none of them is why the frame went dark. The
+      // snapshot is, and it is the only one that is about to end on its own.
+      compare(Model.previewBlocker(cam({ privacy: true, streaming: true }),
+                                   false, true, true), "capturing")
+    }
+
+    function test_no_camera_still_outranks_capturing() {
+      // `snapshotRunning` is set before the helper is asked, so a still requested
+      // on an unplugged camera passes through here. Absent hardware is the honest
+      // answer; "taking a snapshot" would be a promise nothing can keep.
+      compare(Model.previewBlocker(cam({ present: false }), true, true, true), "no-camera")
+    }
+
+    function test_an_omitted_capturing_argument_does_not_block() {
+      // Every call site passes it, but the default has to be "not capturing" —
+      // undefined reading as truthy would put the panel in a permanent snapshot.
+      compare(Model.previewBlocker(cam({}), true, true), "")
+      compare(Model.previewNote(cam({}), true, true), "")
+    }
+
+    function test_the_capturing_note_and_hint_say_it_is_temporary() {
+      // Both, because the note alone ("Taking a snapshot") reads like a state the
+      // preview is stuck in rather than a moment it is yielding.
+      compare(Model.previewNote(cam({}), true, true, true), "Taking a snapshot")
+      verify(Model.previewHint(cam({}), true, true, true) !== "")
+    }
+
     function test_a_missing_state_object_is_no_camera_rather_than_a_crash() {
       // The panel renders before the first helper read returns.
       compare(Model.previewBlocker(null, true, true), "no-camera")
