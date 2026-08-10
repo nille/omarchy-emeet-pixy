@@ -271,6 +271,36 @@ Item {
       verify(Model.pageHints("settings", caps({ hasMic: false })).indexOf("mute") < 0)
     }
 
+    function test_every_letter_a_hint_names_is_a_letter_the_panel_binds() {
+      // The class of bug, not one instance of it: the IMAGE page advertised `n name`
+      // for the whole life of the tab, and the field it means is reached with `s`.
+      // Nothing could see it — the hint is a string and the key map is a chain of
+      // else-ifs in another file, and neither mentions the other.
+      //
+      // So the bound set is written out here, replicated from Panel.qml's onTextKey
+      // the way the cursor suites replicate its row arithmetic. A key added to the
+      // panel and not to this list fails loudly and is one line to fix; a key named
+      // in a hint and bound nowhere is silent and reads as broken hardware.
+      // onTextKey's letters, plus `x` — which reaches the panel as PanelKeyCatcher's
+      // deleteRequested rather than as a character, and is bound all the same.
+      var bound = "cdfimprstvx".split("")
+      var pages = Model.visiblePages(caps({})).map(function(p) { return p.value })
+      pages.push("nonsense")
+      for (var i = 0; i < pages.length; i++) {
+        var hints = Model.pageHints(pages[i], caps({})).split(" · ")
+        for (var j = 0; j < hints.length; j++) {
+          var parts = hints[j].split(" ")
+          // Every hint is a key and what it does. A bare key is unreadable and an
+          // action with no key is a line about nothing.
+          verify(parts.length > 1 && parts[0] !== "" && parts[1] !== "",
+                 pages[i] + ": \"" + hints[j] + "\" is not a key and an action")
+          if (parts[0].length !== 1) continue
+          verify(bound.indexOf(parts[0]) >= 0,
+                 pages[i] + ": `" + parts[0] + "` is named but the panel binds nothing to it")
+        }
+      }
+    }
+
     function test_an_unknown_page_still_gets_the_keys_that_always_work() {
       // Reachable for one frame while `page` and `pages` disagree. A hint line that
       // came back empty would blink the block out and shift the panel's height.
