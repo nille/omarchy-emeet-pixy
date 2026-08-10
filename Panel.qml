@@ -196,6 +196,86 @@ Panel {
 
   MediaDevices { id: mediaDevices }
 
+  // ---------------------------------------------------------------- pages
+  //
+  // *(reported)* "not sure i love the floating sticky thing", of the mini-preview
+  // that used to shrink into the corner of the viewport as you scrolled past it —
+  // itself an answer to *(reported)* "there is no way to see the preview window
+  // when adjusting most of the settings".
+  //
+  // Both reports come from one fact: the panel had grown to about two and a half
+  // screens, so anything below the fold was reached by scrolling the picture away —
+  // and the picture is what half these controls are adjusted against. The dock made
+  // the picture escape the scroll. This removes the scroll: the body is four pages
+  // that each fit, and the preview is pinned above them where nothing moves it.
+  //
+  // Model.PAGES is the list and Model.visiblePages decides which of them this
+  // camera has earned. See the note there for the ordering and for why a page with
+  // nothing on it is worse than a missing tab.
+  property string page: "frame"
+
+  readonly property var pages: Model.visiblePages({
+    hasImage: hasImage,
+    hasMic: hasMic,
+    // The settings page is entirely vendor HID, so a camera whose control
+    // interface could not be opened gets no tab rather than a page of dead rows.
+    hasVendor: present && camera.hidraw !== ""
+  })
+
+  // Switch pages, from a tab click, from `[`/`]`, or from a page's own letter.
+  //
+  // The cursor goes to the top of the new page rather than being remembered per
+  // page. Remembering was tried in the sub-pages this replaces and it reads as the
+  // panel having its own ideas: you come back to IMAGE and the ring is on the fourth
+  // slider because that is where you were three minutes ago. The top is where the
+  // eye already is.
+  function showPage(key) {
+    var next = Model.resolvePage(key, pages)
+    if (next === "") return
+    // Set even when unchanged, because the caller may be re-entering the page after
+    // the list changed under it, and the reads below are what that is for.
+    page = next
+    focusSection = next
+    selectedIndex = 0
+
+    // Each page's data, read when it is first shown rather than up front: the
+    // profile list is a file read and the vendor settings are ten HID queries, and
+    // neither is worth doing for someone who only ever opens FRAME.
+    if (next === "image") readProfiles()
+    if (next === "settings") {
+      if (!vendorLoaded && !vendorLoading) refreshVendor()
+      if (!formatsLoaded) {
+        formatsProc.command = Model.formatsArgs(helper)
+        formatsProc.running = true
+      }
+    }
+
+    // The profile field can hold the keyboard, and `visible: false` on an ancestor
+    // does not take it back — the whole key map goes dead and presses pile up in an
+    // invisible field. Every page change reclaims it, which covers leaving IMAGE by
+    // any route: a bracket key, a tab click, or `d`.
+    if (keyCatcher) keyCatcher.forceActiveFocus()
+    if (next !== "image") profileDraft = ""
+
+    // Pages fit, so this is belt and braces — but a long profile list or a large
+    // font scale can still overflow one, and arriving pre-scrolled would be
+    // baffling.
+    Qt.callLater(function() {
+      if (scrollArea && scrollArea.contentItem) scrollArea.contentItem.contentY = 0
+    })
+  }
+
+  function stepPage(direction) { showPage(Model.stepPage(page, pages, direction)) }
+
+  // Keep `page` on a tab that exists. The mic node comes and goes with PipeWire and
+  // the image list comes from the driver, so the tab bar can lose a page while
+  // someone is standing on it — leaving no tab highlighted and nothing for the
+  // bracket keys to step from.
+  onPagesChanged: {
+    var resolved = Model.resolvePage(page, pages)
+    if (resolved !== page) showPage(resolved)
+  }
+
   // ---------------------------------------------------------------- image
   //
   // Brightness, contrast, and the rest of the UVC picture controls. Read and
@@ -213,8 +293,6 @@ Panel {
   property var image: Model.parseImage("")
   property var imageProfiles: []
   readonly property var imageControls: image.controls
-  readonly property var curatedImage: Model.curatedControls(imageControls)
-  readonly property var advancedImage: Model.advancedControls(imageControls)
   readonly property bool hasImage: imageControls.length > 0
   readonly property var imageValues: Model.controlValues(imageControls)
 
@@ -233,61 +311,17 @@ Panel {
     return pending === undefined ? control : Model.withValue(control, pending)
   }
 
-  // ---- the advanced view ----
-  //
-  // A view rather than a second popup: the advanced controls are the same section
-  // seen closer up, and a nested window would put the framing preview and the
-  // panel's own cursor model behind it. `imageView` swaps the panel body, so the
-  // keyboard model stays one cursor over one visible list.
-  property bool imageAdvanced: false
-
-  // Read by every main-page section, so "a sub-page replaces the panel" is stated
-  // once rather than being an `!imageAdvanced` repeated eight times — and so
-  // adding the second sub-page did not mean revisiting every section.
-  readonly property bool onMainPage: !imageAdvanced && !devicePage
-
-  function openImageAdvanced() {
-    imageAdvanced = true
-    focusSection = "advanced"
-    // The first control, not Back: opening a page with the cursor on the way out
-    // of it makes Enter undo the thing that was just asked for.
-    selectedIndex = advancedControlRow
-    // The profile list is only read here, because this is the only place it is
-    // shown — the main panel never needs it.
-    readProfiles()
-    Qt.callLater(function() {
-      if (scrollArea && scrollArea.contentItem) scrollArea.contentItem.contentY = 0
-    })
-  }
-
-  function closeImageAdvanced() {
-    imageAdvanced = false
-    focusSection = "image"
-    selectedIndex = 0
-    profileDraft = ""
-    // Hiding the field is not enough to release the keyboard. `visible: false` on
-    // an ancestor leaves the TextField holding activeFocus, which keeps
-    // keyCatcher.blocked true — the main page's whole key map goes dead and the
-    // presses pile up in an invisible field. The field's own Esc handler returns
-    // focus, but leaving by the Back button with the mouse does not, so the
-    // catcher takes it back here for every exit path.
-    if (keyCatcher) keyCatcher.forceActiveFocus()
-    Qt.callLater(function() {
-      if (scrollArea && scrollArea.contentItem) scrollArea.contentItem.contentY = 0
-    })
-  }
-
   // The name in the save field. Held here rather than in the TextField so it
-  // survives the field being destroyed when the view closes, and so the Save
+  // survives the field being destroyed when the page changes, and so the Save
   // button and the field agree on one value.
   property string profileDraft: ""
   readonly property string profileDraftState: Model.profileNameState(imageProfiles, profileDraft)
 
   // Put the cursor on the save row and the keyboard in the field together, so
-  // 's' and clicking the field leave the panel in the same state.
+  // 'n' and clicking the field leave the panel in the same state.
   function focusProfileField() {
-    if (!imageAdvanced) return
-    setCursor("advanced", advancedSaveRow)
+    if (page !== "image") return
+    setCursor("image", imageSaveRow)
     // Pre-filled, because "Profile 2" is a better starting point than an empty
     // field: the common case is saving what is on screen under any name at all,
     // and a name that is already there can be typed over.
@@ -295,25 +329,23 @@ Panel {
     if (profileField) profileField.forceActiveFocus()
   }
 
-  // ---------------------------------------------------------------- device page
+  // ---------------------------------------------------------------- camera settings
   //
   // The camera's own firmware settings: microphone DSP mode, gesture control, the
   // orientation flips, what the autofocus aims at, the idle shutter timeout, and
   // the camera's own preset slots. All vendor HID, all persistent in the camera —
-  // which is what makes them worth carrying, and also why they are on a page of
-  // their own rather than in the main list.
+  // which is what makes them worth carrying, and also why they are a page of their
+  // own rather than rows in among the host's controls.
   //
   // Read on demand, not on the refresh timer. `pixy vendor` is ten HID queries
   // sharing one descriptor; it costs ~0.6 s, and none of it changes unless
-  // something here or the vendor app writes it. So it is read when the page opens
-  // and after each write, and never polled.
+  // something here or the vendor app writes it. So it is read when the page is
+  // first opened and after each write, and never polled.
   property var vendor: Model.parseVendor("")
   property var vendorPending: ({})
   readonly property var vendorShown: Model.applyVendorPending(vendor, vendorPending)
   property bool vendorLoaded: false
   property bool vendorLoading: false
-
-  property bool devicePage: false
 
   // The formats list, read once with the page. Read-only by design — see
   // Model.parseFormats — so there is nothing to write back and no reason to reread.
@@ -325,30 +357,6 @@ Panel {
   // previous session is not news.
   property var lastSnapshot: null
   property bool snapshotRunning: false
-
-  function openDevicePage() {
-    devicePage = true
-    focusSection = "device"
-    selectedIndex = deviceBackRow
-    refreshVendor()
-    if (!formatsLoaded) {
-      formatsProc.command = Model.formatsArgs(helper)
-      formatsProc.running = true
-    }
-    Qt.callLater(function() {
-      if (scrollArea && scrollArea.contentItem) scrollArea.contentItem.contentY = 0
-    })
-  }
-
-  function closeDevicePage() {
-    devicePage = false
-    focusSection = "mode"
-    selectedIndex = 0
-    if (keyCatcher) keyCatcher.forceActiveFocus()
-    Qt.callLater(function() {
-      if (scrollArea && scrollArea.contentItem) scrollArea.contentItem.contentY = 0
-    })
-  }
 
   function refreshVendor() {
     if (vendorProc.running) return
@@ -446,7 +454,7 @@ Panel {
   // preset already mirrors into the slot of the same number, so this page only
   // needs to say what they hold and let one be cleared.
   function clearNativePreset(slot) {
-    // Slot 0 is what deviceNativeAt returns for a row that is not a slot at all,
+    // Slot 0 is what settingsNativeAt returns for a row that is not a slot at all,
     // which is how 'x' arrives here from elsewhere on the page.
     if (!present || !slot) return
     vendorWrite(Model.nativePresetArgs(helper, "clear", slot), null)
@@ -647,157 +655,154 @@ Panel {
 
   // ---------------------------------------------------------------- cursor
   //
-  // Sections, top to bottom:
-  //   "header"  - privacy switch (no rows; selectedIndex -1)
-  //   "mode"    - Standard / Tracking chips (0)
-  //   "framing" - preview switch (0), pan (1), tilt (2), zoom (3), recenter (4)
-  //   "image"   - one row per curated image control, only when the camera has any
-  //   "mic"     - volume slider (0), only when the camera's mic is present
-  //   "presets" - one row per slot (0..2)
+  // One page, one section, and `focusSection` is the page. That is the simplification
+  // the tabs bought: j/k walks one list that is entirely on screen, so there is no
+  // walking between groups and no section that scrolls into view as you reach it.
   //
-  // Two sub-pages replace all of them with one section of their own — "advanced"
-  // for the image controls, "device" for the camera's firmware settings. Each is a
-  // different page, not a longer one, so walking the cursor between them would be
-  // walking between screens.
+  // The rows on each page, top to bottom:
+  //   "frame"    - mode chips (0), preview switch (1), pan (2), tilt (3), zoom (4),
+  //                recenter (5), then one row per preset slot
+  //   "image"    - one row per control, then one per saved profile, then the save
+  //                field. Curated and advanced controls are one list now: the page
+  //                fits either way, and the split existed to keep the main page
+  //                short.
+  //   "mic"      - the volume slider (0)
+  //   "settings" - the firmware rows, in drawn order
+  //
+  // The privacy switch is in the hero above the tabs, so it is on every page and
+  // belongs to none: "header" is a section with no rows that j/k never walks into,
+  // reached by hovering the switch and by `p`.
   //
   // The jog pad is deliberately not a cursor row: PanelKeyCatcher maps the arrow
   // keys to the same signal as h/j/k/l, so a 2D pad has no keys of its own to
   // claim. The pan and tilt sliders are the keyboard path — and they show the
   // current angle, which the pad cannot.
-  property string focusSection: "mode"
+  property string focusSection: "frame"
   property int selectedIndex: 0
   property bool cursorActive: false
 
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
 
-  // "mic" appears only when the camera's own microphone is on the graph, so j/k
-  // never walks onto a section that is not rendered — a camera without a mic, or
-  // one whose mic node has not appeared yet, would otherwise give the cursor a
-  // dead stop halfway down the panel.
-  readonly property var visibleSections: {
-    // The sub-pages are their own pages, so each is the only section on itself —
-    // and they keep "header" out too, because the hero is hidden there.
-    if (imageAdvanced) return ["advanced"]
-    if (devicePage) return ["device"]
-    var list = ["header"]
-    if (present) {
-      list.push("mode", "framing")
-      // Same reasoning as "mic": a camera whose image controls could not be read
-      // renders no section, so the cursor must not be able to land on one.
-      if (hasImage) list.push("image")
-      if (hasMic) list.push("mic")
-      list.push("presets", "camera")
-    }
-    return list
-  }
-
   function sectionCount(section) {
     if (section === "header") return 0
-    if (section === "mode") return 1
-    if (section === "framing") return 5
-    // Row per control rather than a fixed count: the list comes from the driver.
-    if (section === "image") return curatedImage.length
-    // Back, then the advanced rows, then the profile list and its save field.
-    if (section === "advanced") return advancedImage.length + 2 + imageProfiles.length
-    if (section === "device") return deviceNativeRow + Model.PRESET_SLOTS.length
+    if (section === "frame") return framePresetRow + Model.PRESET_SLOTS.length
+    // The controls, then the profile list, then the save field. Row per control
+    // rather than a fixed count: the list comes from the driver.
+    if (section === "image") return imageControls.length + 1 + imageProfiles.length
     if (section === "mic") return 1
-    if (section === "presets") return Model.PRESET_SLOTS.length
-    // The one row that opens the device page. A section of its own rather than a
-    // cog on some other header, because nothing above it is what it leads to.
-    if (section === "camera") return 1
+    if (section === "settings") return settingsNativeRow + Model.PRESET_SLOTS.length
     return 0
   }
 
-  // The advanced view's rows, laid out as: Back, then every control, then one row
-  // per saved profile, then the save field. Named rather than compared inline so
-  // the layout is stated once and the four places that dispatch on it agree.
+  // ---- the FRAME page's rows ----
   //
-  // Back is row 0 because it is drawn first. It was numbered after the last
-  // control at one point, on the theory that j from the bottom of the list should
-  // reach it — but that makes j jump from the bottom slider to the top of the
-  // page and then back down into the profiles, which reads as the cursor
-  // misfiring. Drawn order is the only order the eye can follow.
-  readonly property int advancedBackRow: 0
-  readonly property int advancedControlRow: 1
-  readonly property int advancedProfileRow: advancedControlRow + advancedImage.length
-  readonly property int advancedSaveRow: advancedProfileRow + imageProfiles.length
+  // Numbered in drawn order, which is the rule every page here follows: rows are
+  // numbered down the screen so j goes down the screen. The presets moved onto this
+  // page because they *are* framing — a preset recalls where the lens points — and
+  // the page has room for them now.
+  readonly property int frameModeRow: 0
+  readonly property int framePreviewRow: 1
+  readonly property int framePanRow: 2
+  readonly property int frameTiltRow: 3
+  readonly property int frameZoomRow: 4
+  readonly property int frameHomeRow: 5
+  readonly property int framePresetRow: 6
 
-  function advancedControlAt(index) {
-    var i = index - advancedControlRow
-    return i >= 0 && i < advancedImage.length ? advancedImage[i] : null
-  }
-
-  function advancedProfileAt(index) {
-    var i = index - advancedProfileRow
-    return i >= 0 && i < imageProfiles.length ? imageProfiles[i] : ""
-  }
-
-  // The device page's rows, in drawn order for the same reason the advanced view's
-  // are: rows are numbered down the screen, so j goes down the screen. Two of the
-  // groups have their length from Model rather than from here, so the arithmetic
-  // chains rather than being written out — adding a fourth orientation toggle then
-  // needs no change below.
-  //
-  // The formats list is deliberately not in here. It is read-only text, so a
-  // cursor row for it would be a row where Enter does nothing — the same dead stop
-  // the advanced page's tests exist to prevent.
-  readonly property int deviceBackRow: 0
-  readonly property int deviceAudioRow: 1
-  readonly property int deviceGestureRow: 2
-  readonly property int deviceFocusRow: 3
-  readonly property int deviceFeatureRow: 4
-  readonly property int deviceAutoPrivacyRow: deviceFeatureRow + Model.FEATURE_TOGGLES.length
-  readonly property int deviceCallRow: deviceAutoPrivacyRow + 1
-  readonly property int deviceSnapshotRow: deviceCallRow + Model.CALL_ACTION_META.length
-  readonly property int deviceNativeRow: deviceSnapshotRow + 1
-
-  function deviceFeatureAt(index) {
-    var i = index - deviceFeatureRow
-    return i >= 0 && i < Model.FEATURE_TOGGLES.length ? Model.FEATURE_TOGGLES[i] : null
-  }
-
-  function deviceCallAt(index) {
-    var i = index - deviceCallRow
-    return i >= 0 && i < Model.CALL_ACTION_META.length ? Model.CALL_ACTION_META[i] : null
-  }
-
-  function deviceNativeAt(index) {
-    var i = index - deviceNativeRow
+  function framePresetAt(index) {
+    var i = index - framePresetRow
+    // Zero rather than null for the same reason settingsNativeAt returns it: `x` on a
+    // non-preset row must not clear slot 1, and every caller guards on falsiness.
     return i >= 0 && i < Model.PRESET_SLOTS.length ? Model.PRESET_SLOTS[i] : 0
   }
 
-  // Enter on a device row. Chip groups cycle rather than toggle, matching what
+  // ---- the IMAGE page's rows ----
+  //
+  // One list of controls rather than the curated/advanced split the main page used
+  // to need. That split was about panel length: five sliders on the main page and
+  // the rest behind a cog, because all fourteen made the panel unscrollably long.
+  // The page fits all of them, so the reason is gone — and a cog leading to "the
+  // other controls" was never something to explain to anyone.
+  //
+  // The helper's order is kept, which is editorial: an auto switch sits below the
+  // slider it gates.
+  readonly property int imageControlRow: 0
+  readonly property int imageProfileRow: imageControlRow + imageControls.length
+  readonly property int imageSaveRow: imageProfileRow + imageProfiles.length
+
+  function imageControlAt(index) {
+    var i = index - imageControlRow
+    return i >= 0 && i < imageControls.length ? imageControls[i] : null
+  }
+
+  function imageProfileAt(index) {
+    var i = index - imageProfileRow
+    return i >= 0 && i < imageProfiles.length ? imageProfiles[i] : ""
+  }
+
+  // ---- the SETTINGS page's rows ----
+  //
+  // Drawn order again. Two of the groups take their length from Model rather than
+  // from here, so the arithmetic chains rather than being written out — adding a
+  // fourth orientation toggle needs no change below.
+  //
+  // The formats list is deliberately not in here. It is read-only text, so a cursor
+  // row for it would be a row where Enter does nothing — the dead stop the row-order
+  // tests exist to prevent.
+  readonly property int settingsAudioRow: 0
+  readonly property int settingsGestureRow: 1
+  readonly property int settingsFocusRow: 2
+  readonly property int settingsFeatureRow: 3
+  readonly property int settingsAutoPrivacyRow: settingsFeatureRow + Model.FEATURE_TOGGLES.length
+  readonly property int settingsCallRow: settingsAutoPrivacyRow + 1
+  readonly property int settingsSnapshotRow: settingsCallRow + Model.CALL_ACTION_META.length
+  readonly property int settingsNativeRow: settingsSnapshotRow + 1
+
+  function settingsFeatureAt(index) {
+    var i = index - settingsFeatureRow
+    return i >= 0 && i < Model.FEATURE_TOGGLES.length ? Model.FEATURE_TOGGLES[i] : null
+  }
+
+  function settingsCallAt(index) {
+    var i = index - settingsCallRow
+    return i >= 0 && i < Model.CALL_ACTION_META.length ? Model.CALL_ACTION_META[i] : null
+  }
+
+  function settingsNativeAt(index) {
+    var i = index - settingsNativeRow
+    return i >= 0 && i < Model.PRESET_SLOTS.length ? Model.PRESET_SLOTS[i] : 0
+  }
+
+  // Enter on a settings row. Chip groups cycle rather than toggle, matching what
   // h/l does to them, so one key covers a three-option row.
-  function activateDeviceRow(index) {
-    if (index === deviceBackRow) { closeDevicePage(); return }
-    if (index === deviceAudioRow) { cycleAudio(1); return }
-    if (index === deviceGestureRow) { setGesture(!vendorShown.gesture); return }
-    if (index === deviceFocusRow) { cycleFocus(1); return }
-    if (index === deviceAutoPrivacyRow) { cycleAutoPrivacy(1); return }
-    if (index === deviceSnapshotRow) { takeSnapshot(); return }
-    var feature = deviceFeatureAt(index)
+  function activateSettingsRow(index) {
+    if (index === settingsAudioRow) { cycleAudio(1); return }
+    if (index === settingsGestureRow) { setGesture(!vendorShown.gesture); return }
+    if (index === settingsFocusRow) { cycleFocus(1); return }
+    if (index === settingsAutoPrivacyRow) { cycleAutoPrivacy(1); return }
+    if (index === settingsSnapshotRow) { takeSnapshot(); return }
+    var feature = settingsFeatureAt(index)
     if (feature) { setFeature(feature.key, !vendorShown.features[feature.key]); return }
-    var call = deviceCallAt(index)
+    var call = settingsCallAt(index)
     if (call) { setCallAction(call.setting, !callActions[call.key]); return }
-    var slot = deviceNativeAt(index)
+    var slot = settingsNativeAt(index)
     // A native slot's only action from the keyboard is to be cleared: saving one
-    // happens through the framing presets above, which mirror into it and also
-    // record the zoom these slots cannot hold.
+    // happens through the FRAME page's presets, which mirror into it and also record
+    // the zoom these slots cannot hold.
     if (slot) clearNativePreset(slot)
   }
 
-  // h/l on a device row. Only the chip groups have a direction; the switches use
+  // h/l on a settings row. Only the chip groups have a direction; the switches use
   // Enter, matching how the image page treats booleans versus menus.
-  function adjustDeviceRow(index, direction) {
-    if (index === deviceAudioRow) { cycleAudio(direction); return }
-    if (index === deviceFocusRow) { cycleFocus(direction); return }
-    if (index === deviceAutoPrivacyRow) { cycleAutoPrivacy(direction); return }
+  function adjustSettingsRow(index, direction) {
+    if (index === settingsAudioRow) { cycleAudio(direction); return }
+    if (index === settingsFocusRow) { cycleFocus(direction); return }
+    if (index === settingsAutoPrivacyRow) { cycleAutoPrivacy(direction); return }
     // A switch keeps direction meaningful, as the image page's booleans do: l
     // turns it on, h off, so pressing l on something already on leaves it on.
-    if (index === deviceGestureRow) { setGesture(direction > 0); return }
-    var feature = deviceFeatureAt(index)
+    if (index === settingsGestureRow) { setGesture(direction > 0); return }
+    var feature = settingsFeatureAt(index)
     if (feature) { setFeature(feature.key, direction > 0); return }
-    var call = deviceCallAt(index)
+    var call = settingsCallAt(index)
     if (call) setCallAction(call.setting, direction > 0)
   }
 
@@ -841,40 +846,22 @@ Panel {
     selectedIndex = index
   }
 
+  // j/k, within the page. One list, so this is a clamp rather than the two-level
+  // walk it used to be — and the ends stop rather than wrapping, matching the tab
+  // bar and for the same reason: a cursor that reappears at the top reads as having
+  // jumped rather than moved. `[` and `]` are how you leave a page.
   function moveCursor(delta) {
-    var sections = visibleSections
-    if (!sections.length) return
-    var sIdx = sections.indexOf(focusSection)
-    if (sIdx < 0) {
-      focusSection = sections[0]
-      selectedIndex = sectionCount(focusSection) ? 0 : -1
-      return
-    }
     var max = sectionCount(focusSection) - 1
-
-    if (delta > 0) {
-      if (selectedIndex < max) { selectedIndex = selectedIndex + 1; return }
-      if (sIdx < sections.length - 1) {
-        focusSection = sections[sIdx + 1]
-        selectedIndex = sectionCount(focusSection) ? 0 : -1
-      }
-    } else {
-      if (selectedIndex > 0) { selectedIndex = selectedIndex - 1; return }
-      if (sIdx > 0) {
-        var prev = sections[sIdx - 1]
-        focusSection = prev
-        var prevMax = sectionCount(prev) - 1
-        selectedIndex = prevMax >= 0 ? prevMax : -1
-      }
-    }
+    if (max < 0) return
+    // Arriving from the hero switch, which is not a row on any page.
+    if (focusSection === "header" || selectedIndex < 0) { selectedIndex = 0; return }
+    selectedIndex = Math.max(0, Math.min(max, selectedIndex + (delta > 0 ? 1 : -1)))
   }
 
-  // h/l adjusts whichever control the cursor sits on.
+  // h/l adjusts whichever control the cursor sits on. Deliberately not page
+  // movement: these are the keys that sweep a slider, which is most of what this
+  // panel is, so the pages got the bracket keys instead.
   function adjustHorizontal(direction) {
-    if (focusSection === "mode") {
-      setMode(camera.mode === "tracking" ? "standard" : "tracking")
-      return
-    }
     if (focusSection === "mic") {
       // 5% a press, matching the granularity of the shell's own audio panel so
       // one h/l feels the same everywhere in the bar.
@@ -882,23 +869,22 @@ Panel {
       return
     }
     if (focusSection === "image") {
-      adjustControl(curatedImage[selectedIndex], direction)
+      adjustControl(imageControlAt(selectedIndex), direction)
       return
     }
-    if (focusSection === "advanced") {
-      adjustControl(advancedControlAt(selectedIndex), direction)
+    if (focusSection === "settings") {
+      adjustSettingsRow(selectedIndex, direction)
       return
     }
-    if (focusSection === "device") {
-      adjustDeviceRow(selectedIndex, direction)
-      return
-    }
-    if (focusSection !== "framing") return
-    // The preview switch (row 0) is boolean, so h/l has nothing to sweep — Enter
-    // and `v` are its interaction, the same as the mode chips.
-    if (selectedIndex === 1) setPan(shownPan + direction * ptzStep)
-    else if (selectedIndex === 2) setTilt(shownTilt + direction * ptzStep)
-    else if (selectedIndex === 3) setZoom(shownZoom + direction * 5)
+    if (focusSection !== "frame") return
+    // The mode chips and the preview switch are both boolean-ish, so h/l has
+    // nothing to sweep on them — Enter, `t` and `v` are their interaction. The
+    // presets likewise: Enter recalls, `s` saves, `x` clears.
+    if (selectedIndex === frameModeRow)
+      setMode(camera.mode === "tracking" ? "standard" : "tracking")
+    else if (selectedIndex === framePanRow) setPan(shownPan + direction * ptzStep)
+    else if (selectedIndex === frameTiltRow) setTilt(shownTilt + direction * ptzStep)
+    else if (selectedIndex === frameZoomRow) setZoom(shownZoom + direction * 5)
   }
 
   // h/l on an image row. What that means depends on the control, and all three
@@ -941,70 +927,63 @@ Panel {
 
   function activateCursor() {
     if (focusSection === "header") { togglePrivacy(); return }
-    if (focusSection === "mode") {
-      setMode(camera.mode === "tracking" ? "standard" : "tracking")
-      return
-    }
-    // Sliders have no activate action — h/l is their whole interaction.
-    if (focusSection === "framing") {
-      if (selectedIndex === 0) togglePreview()
-      else if (selectedIndex === 4) home()
+    if (focusSection === "frame") {
+      // Sliders have no activate action — h/l is their whole interaction.
+      if (selectedIndex === frameModeRow) {
+        setMode(camera.mode === "tracking" ? "standard" : "tracking")
+        return
+      }
+      if (selectedIndex === framePreviewRow) { togglePreview(); return }
+      if (selectedIndex === frameHomeRow) { home(); return }
+      var slot = framePresetAt(selectedIndex)
+      // Recall a saved slot, store into an empty one. One key doing both is what
+      // makes presets usable without reaching for the mouse, and an empty slot has
+      // no other sensible action.
+      if (slot) {
+        if (Model.hasPreset(presets, slot)) loadPreset(slot)
+        else savePreset(slot)
+      }
       return
     }
     if (focusSection === "image") {
-      activateControl(curatedImage[selectedIndex])
-      return
-    }
-    if (focusSection === "advanced") {
-      if (selectedIndex === advancedBackRow) { closeImageAdvanced(); return }
-      if (selectedIndex === advancedSaveRow) {
+      if (selectedIndex === imageSaveRow) {
         // Enter on the name field means "type here" while it is empty, and "save
         // that" once it is not. Both because saving a blank name does nothing —
         // which made Enter a dead key on the one row that looks most like it wants
         // one — and because the cursor is drawn on the field without the field
         // holding the keyboard, so typing a name went to the shortcuts instead and
-        // the `i` in "Evening" closed the whole view. Found by typing into it.
+        // a letter in the name fired a shortcut. Found by typing into it.
         if (profileDraftState === "blank") focusProfileField()
         else saveProfile(profileDraft)
         return
       }
-      var name = advancedProfileAt(selectedIndex)
+      var name = imageProfileAt(selectedIndex)
       // Recall, matching the framing presets: a saved profile's one action is to
       // be applied, and `x` is how every panel in the bar spells "remove this".
       if (name) { loadProfile(name); return }
-      activateControl(advancedControlAt(selectedIndex))
+      activateControl(imageControlAt(selectedIndex))
       return
     }
-    if (focusSection === "device") {
-      activateDeviceRow(selectedIndex)
+    if (focusSection === "settings") {
+      activateSettingsRow(selectedIndex)
       return
     }
-    if (focusSection === "camera") { openDevicePage(); return }
     // The mic row is the exception: its slider does have an activate action,
     // because mute is the thing you reach for in a hurry and h/l down to zero is
     // not the same as muting.
-    if (focusSection === "mic") { toggleMicMute(); return }
-    if (focusSection === "presets") {
-      var slot = Model.PRESET_SLOTS[selectedIndex]
-      // Recall a saved slot, store into an empty one. One key doing both is
-      // what makes presets usable without reaching for the mouse, and an empty
-      // slot has no other sensible action.
-      if (Model.hasPreset(presets, slot)) loadPreset(slot)
-      else savePreset(slot)
-    }
+    if (focusSection === "mic") toggleMicMute()
   }
 
+  // Keep the cursor on a row that exists. Called on every republish, because the
+  // lists it indexes into come from outside: the driver decides how many image
+  // controls there are and the user decides how many profiles.
   function clampCursor() {
-    var sections = visibleSections
-    if (!sections.length) return
     // "header" has no rows, so let it through rather than knocking the cursor
     // off the privacy switch every time a refresh republishes state.
     if (focusSection === "header") return
-    if (sections.indexOf(focusSection) < 0) {
-      focusSection = sections[0]
-      selectedIndex = sectionCount(focusSection) ? 0 : -1
-      return
-    }
+    // The section *is* the page, so a mismatch means one of them was set without
+    // the other. The page is the authority: it is what is drawn.
+    if (focusSection !== page) { focusSection = page; selectedIndex = 0; return }
     var count = sectionCount(focusSection)
     if (count === 0) { selectedIndex = -1; return }
     if (selectedIndex > count - 1) selectedIndex = count - 1
@@ -1323,9 +1302,9 @@ Panel {
     // recalls the profile just written rather than saving again. So the cursor is
     // followed to where the row went; clampCursor only pulls it back in range,
     // which does nothing when the page got longer.
-    var onSaveRow = focusSection === "advanced" && selectedIndex === advancedSaveRow
+    var onSaveRow = focusSection === "image" && selectedIndex === imageSaveRow
     imageProfiles = Model.parseProfiles(raw)
-    if (onSaveRow) selectedIndex = advancedSaveRow
+    if (onSaveRow) selectedIndex = imageSaveRow
     // `load` and `save` answer with a full readback; `list` and every failure do
     // not, and merging is what keeps those from blanking the section.
     image = Model.mergeImage(image, raw)
@@ -1716,22 +1695,21 @@ Panel {
       // picture, so reading fifteen controls before the panel is ever opened would
       // be work done for nobody.
       refreshImage()
-      // Here rather than only when the cog opens, because `state` reports the
-      // profile names and a script should not have to open a sub-page to get an
+      // Here rather than only on the IMAGE page, because `state` reports the
+      // profile names and a script should not have to switch pages to get an
       // answer. It costs nothing worth deferring: profiles live in a JSON file, so
       // this reads it without touching the camera.
       readProfiles()
-      // Always the main page on open. Either sub-page is somewhere you go for a
-      // specific reason, and reopening the panel into one would hide the framing
-      // controls from whoever forgot they left it there.
-      imageAdvanced = false
-      devicePage = false
+      // Always FRAME on open. Aiming the camera is what the widget is for, and
+      // reopening into IMAGE or SETTINGS would hide it from whoever forgot which
+      // page they left the panel on.
+      page = "frame"
       profileDraft = ""
       // A path from a previous session is not news, and neither is a note about a
       // call that has already ended.
       lastSnapshot = null
       callNote = ""
-      focusSection = present ? "mode" : "header"
+      focusSection = present ? "frame" : "header"
       selectedIndex = present ? 0 : -1
       cursorActive = false
       // Clear a previous session's failure so a camera that was busy last time
@@ -1815,7 +1793,20 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(360))
-    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(620))
+    // The pinned block counts too: it is outside the ScrollView, so a height asked
+    // for the scrolled column alone would leave the panel exactly the pinned block
+    // too short and the pages permanently scrolling by that much.
+    //
+    // The cap is taller than the 560-640 the first-party panels use, because the
+    // pinned block is most of a picture: the preview alone is around 180px of the
+    // 270 above the pages. Sized so FRAME fits under it exactly — that is the page
+    // aiming happens on, and a jog pad you have to scroll to reach is the whole
+    // problem this restructure was about. IMAGE and SETTINGS are longer than any
+    // cap worth setting and still scroll; what changed is that scrolling them no
+    // longer takes the picture with it.
+    contentHeight: panel.fittedContentHeight(
+      pinnedColumn.implicitHeight + Style.spacing.panelGap + panelColumn.implicitHeight,
+      Style.space(920))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -1831,69 +1822,362 @@ Panel {
         else if (dx !== 0) root.adjustHorizontal(dx)
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
-      // Esc backs out of the advanced view before it closes the panel, which is
-      // what a nested view has to do: closing the whole panel from inside a
-      // sub-page loses two levels for one press.
-      onCloseRequested: {
-        if (root.imageAdvanced) root.closeImageAdvanced()
-        else if (root.devicePage) root.closeDevicePage()
-        else root.close()
-      }
+      // Esc closes, from every page. It used to unwind the sub-pages first, which a
+      // nested view has to do — but the pages are siblings now, not levels, so there
+      // is nothing above them to back out to and one press is the whole gesture.
+      onCloseRequested: root.close()
+      // Tab stays with the bar. Every other panel in the shell binds it to
+      // switchPanel, and a plugin that means something else by the one key that
+      // works everywhere is a worse trade than the pages taking a less obvious key.
       onTabRequested: function(direction) { root.switchPanel(direction) }
       // 'x' arrives here rather than through textKey — PanelKeyCatcher gives it
       // its own signal so every panel spells "remove this" the same way.
       onDeleteRequested: {
-        if (root.focusSection === "presets")
-          root.clearPreset(Model.PRESET_SLOTS[root.selectedIndex])
-        else if (root.focusSection === "advanced")
-          root.clearProfile(root.advancedProfileAt(root.selectedIndex))
-        // On the device page 'x' only means anything on a native slot, and there
-        // it means the same as Enter — those rows have exactly one action.
-        else if (root.focusSection === "device")
-          root.clearNativePreset(root.deviceNativeAt(root.selectedIndex))
+        if (root.focusSection === "frame")
+          root.clearPreset(root.framePresetAt(root.selectedIndex))
+        else if (root.focusSection === "image")
+          root.clearProfile(root.imageProfileAt(root.selectedIndex))
+        // On SETTINGS 'x' only means anything on a native slot, and there it means
+        // the same as Enter — those rows have exactly one action.
+        else if (root.focusSection === "settings")
+          root.clearNativePreset(root.settingsNativeAt(root.selectedIndex))
       }
       onTextKey: function(t) {
         var key = t.toLowerCase()
-        if (key === "p") root.togglePrivacy()
+        // The pages move on the bracket keys: next to each other, unshifted, and
+        // free — h/l sweeps sliders and Tab belongs to the bar.
+        if (t === "]") root.stepPage(1)
+        else if (t === "[") root.stepPage(-1)
+        else if (key === "p") root.togglePrivacy()
         else if (key === "t") root.setMode(root.camera.mode === "tracking" ? "standard" : "tracking")
         else if (key === "c") root.home()
         else if (key === "m") root.toggleMicMute()
         // 'v' for video: 'p' is privacy and the preview is the video feed.
         else if (key === "v") root.togglePreview()
         else if (key === "r") { root.refresh(); root.refreshImage() }
-        // 'i' for image: the advanced view, from either side. 'a' would collide
-        // with nothing today but reads as "auto" next to three auto switches.
-        else if (key === "i") {
-          if (root.imageAdvanced) root.closeImageAdvanced()
-          else if (root.devicePage) { /* not from here — 'd' owns this page */ }
-          else if (root.hasImage) root.openImageAdvanced()
-        }
-        // 'd' for device: the camera's own settings, from either side. Not 'c',
-        // which recenters, and not 'v', which is the preview.
-        else if (key === "d") {
-          if (root.devicePage) root.closeDevicePage()
-          else if (root.present && !root.imageAdvanced) root.openDevicePage()
-        }
+        // The initials jump straight to a page, which is what the two sub-page keys
+        // did before and is now worth keeping for all four: four pages is few enough
+        // that stepping to the far one is three presses of a key that could be one.
+        else if (key === "f") root.showPage("frame")
+        else if (key === "i") root.showPage("image")
+        else if (key === "d") root.showPage("settings")
         else if (key === "s") {
-          // Store into the slot under the cursor, which is the only slot the
-          // keyboard has unambiguously selected.
-          if (root.focusSection === "presets")
-            root.savePreset(Model.PRESET_SLOTS[root.selectedIndex])
-          // In the advanced view 's' is the profile name field, because naming is
-          // the part of saving a profile that needs the keyboard.
-          else if (root.focusSection === "advanced") root.focusProfileField()
+          // On FRAME 's' saves into the slot under the cursor, which is the only
+          // slot the keyboard has unambiguously selected. On IMAGE it is the profile
+          // name field, because naming is the part of saving that needs the keyboard.
+          if (root.focusSection === "frame")
+            root.savePreset(root.framePresetAt(root.selectedIndex))
+          else if (root.focusSection === "image") root.focusProfileField()
         }
-        // Framing presets only, and only on the main page: the advanced view's
-        // profiles are named, not numbered, and the device page's rows are the
-        // camera's own slots — recalling a framing preset from either would act on
-        // a list that is not on screen.
-        else if (root.onMainPage
+        // Framing presets, and only on FRAME: IMAGE's profiles are named rather than
+        // numbered and SETTINGS' slots are the camera's own, so recalling a framing
+        // preset from either would act on a list that is not on screen.
+        else if (root.page === "frame"
                  && (key === "1" || key === "2" || key === "3")) root.loadPreset(Number(key))
+      }
+
+      // ---------------------------------------------------------------- pinned
+      //
+      // Everything above the pages, and outside the ScrollView on purpose.
+      //
+      // *(reported)* "since it is longer than the containing box there is no way to
+      // see the preview window when adjusting most of the settings", and then, of the
+      // floating mini-preview that first answered it, "not sure i love the floating
+      // sticky thing". The picture is what you judge mirroring, focus, brightness and
+      // every image slider by, and it was a row near the top of a scrolling column
+      // two pages taller than its box.
+      //
+      // Sibling of the ScrollView rather than its first row, which is the whole fix:
+      // the pages below can scroll as much as they like and none of it reaches the
+      // picture. The floating version got the picture out of the scroll by animating
+      // it out; this gives it somewhere the scroll never was.
+      //
+      // The hero comes along because privacy belongs next to the picture — the switch
+      // and the thing it closes should not be a scroll apart — and because it is the
+      // panel's title.
+      Column {
+        id: pinnedColumn
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        spacing: Style.spacing.panelGap
+
+        // ---------- Hero: lens · title/status · privacy switch ----------
+        PanelHero {
+          id: heroRow
+          width: parent.width
+          title: "PIXY"
+          meta: root.loading && !root.everLoaded
+            ? "Looking for the camera"
+            : Model.summary(root.camera)
+          detail: Model.streamLabel(root.camera)
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          iconOpacity: root.present ? 1.0 : 0.5
+
+          // Status only — the switch owns privacy, mouse and keyboard alike.
+          iconComponent: Component {
+            Text {
+              text: Model.barIcon(root.camera)
+              // Same reasoning as barIconColor: the glyph carries the state.
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+            }
+          }
+
+          // The quick lens-cover, and the header's only cursor target.
+          trailingControl: Component {
+            ToggleSwitch {
+              id: privacySwitch
+              checked: root.privacy
+              hasCursor: root.headerHasCursor
+              foreground: root.foreground
+              // Privacy reads as an alert state, not a neutral preference.
+              accent: root.urgent
+              enabled: root.present
+              opacity: enabled ? 1.0 : 0.4
+              onHovered: function(on) { if (on) root.setHeaderCursor() }
+              onToggled: root.togglePrivacy()
+
+              PanelToolTip {
+                visible: privacySwitch.containsMouse
+                text: root.privacy ? "Open the lens" : "Close the lens"
+                fontFamily: root.fontFamily
+              }
+            }
+          }
+        }
+        // ---------- Pages ----------
+        //
+        // A tab bar rather than the two entry rows and two Back rows this replaces.
+        // Four pages that each fit beat one page that does not: the sub-pages were
+        // already body-replacing views reached by their own keys, so making them
+        // siblings of FRAME costs nothing and buys the same treatment for the rest.
+        //
+        // Not in the j/k cursor walk, the same call ButtonGroup gets everywhere else
+        // in this panel: `[` and `]` move between pages, and a tab bar that also
+        // caught j/k would put a row of chips between the cursor and every control.
+        CursorSurface {
+          id: pageRow
+          width: parent.width
+          implicitHeight: pageGroup.implicitHeight + Style.spacing.controlGap
+          visible: root.present && root.pages.length > 1
+          foreground: root.foreground
+          accent: root.accent
+          outline: false
+
+          ButtonGroup {
+            id: pageGroup
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(6)
+            anchors.rightMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.spacing.sm
+            options: root.pages
+            value: root.page
+            // The label is what the chip says; the key is what it means. PAGES
+            // carries both, and ButtonGroup keys on `value`, so this needs no
+            // mapping — which is why the page keys are strings rather than indices.
+            foreground: root.foreground
+            accent: root.accent
+            background: root.bar ? root.bar.background : Color.background
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            focusable: false
+            cursorIndex: -1
+            onChanged: function(value) { root.showPage(value) }
+          }
+        }
+
+        // ---------- Preview ----------
+        //
+        // One camera and one VideoOutput throughout. Re-parenting or duplicating it
+        // would mean two objects wanting the same /dev/videoN, and the second would
+        // fail with EBUSY against the first — the panel's own preview competing with
+        // itself, which is the failure this widget spends the most care avoiding.
+        // Keeping it in one fixed place is what makes that easy to hold: there is
+        // nowhere for it to move to.
+        //
+        // 16:9 at a fixed width, and no longer any arithmetic — the docked version
+        // computed a size and a corner from the scroll position, and all of it is
+        // gone with the scroll it tracked.
+        //
+        // Turned off entirely by the setting rather than left as an empty frame:
+        // someone who disabled the preview does not want a permanent reminder of it
+        // taking up a third of the panel. Every other blocked state keeps the frame,
+        // because those are temporary and the placeholder is how the panel explains
+        // itself.
+        Item {
+          id: previewArea
+          visible: root.previewEnabled && root.present
+          anchors.horizontalCenter: parent.horizontalCenter
+          width: parent.width - Style.space(12)
+          height: visible ? Math.round(width * Model.PREVIEW_ASPECT) : 0
+
+          Rectangle {
+            id: previewFrame
+            anchors.fill: parent
+            radius: Style.cornerRadius
+            color: Qt.darker(root.bar ? root.bar.background : Color.background, 1.3)
+            // The ordinary faint outline, at one width in one colour. The floating
+            // version needed an accent edge and a shadow to separate itself from the
+            // rows it covered; this one covers nothing — it has a place of its own
+            // above the pages, and the layout does the separating.
+            border.width: Style.normalBorderWidth
+            border.color: root.faint
+
+            // The video is clipped by this inset child rather than by the frame
+            // itself, and the inset is what makes the border survive.
+            //
+            // *(observed)* `clip: true` on the bordered Rectangle scissored away
+            // its own top border row. The frame's top edge lands on a fractional
+            // device row at 1.25x scale — 214.4 — while its bottom lands on a
+            // whole one, so the scissor rect rounds inward at the top only and
+            // eats the 1px border there. Three sides drawn and one missing, which
+            // is how it was reported.
+            //
+            // Live video hid it: the picture is painted over that row, so the bug
+            // was only visible with the lens closed or the camera busy — the
+            // states where the frame is empty and its outline is the only thing
+            // there. Clipping a child inset by the border width keeps the scissor
+            // rect strictly inside the border instead of on top of it, so no
+            // rounding direction can clip it.
+            Item {
+              id: previewClip
+              anchors.fill: parent
+              anchors.margins: previewFrame.border.width
+              clip: true
+
+              // The Camera lives inside a Loader, and this is not a lazy-init
+              // nicety: assigning `cameraDevice` opens /dev/videoN and holds the
+              // fd for as long as the object exists, whether or not it is
+              // `active`. A permanently-instantiated Camera therefore keeps an
+              // open handle on the webcam from shell startup — which is exactly
+              // the thing a privacy-facing widget must not do. Unloading it is
+              // what actually releases the device.
+              Loader {
+                id: previewLoader
+                anchors.fill: parent
+                active: root.previewWanted && root.previewDevice !== null
+
+                sourceComponent: Component {
+                  Item {
+                    CaptureSession {
+                      camera: liveCamera
+                      videoOutput: liveOutput
+                    }
+
+                    Camera {
+                      id: liveCamera
+                      active: true
+                      cameraDevice: root.previewDevice
+                      // Left unset if no suitable format was found, rather than
+                      // assigned null: Qt then picks its own, which is worse
+                      // than pinned but better than refusing to start.
+                      cameraFormat: root.previewFormat ? root.previewFormat : cameraFormat
+                      onErrorOccurred: function(error, errorString) {
+                        // A camera held by a meeting app is the common case and
+                        // is not worth a scary message, so the overlay below
+                        // states it plainly and the panel carries on.
+                        root.previewError = errorString || "preview unavailable"
+                      }
+                    }
+
+                    VideoOutput {
+                      id: liveOutput
+                      anchors.fill: parent
+                      fillMode: VideoOutput.PreserveAspectCrop
+                      visible: root.previewError === ""
+                    }
+                  }
+                }
+              }
+            }
+
+            // Stands in for the image whenever there is nothing to show, so
+            // the space never reads as a broken video element. Saying why is
+            // the whole point: a blank preview during a call is otherwise
+            // indistinguishable from a broken widget.
+            Column {
+              anchors.centerIn: parent
+              width: parent.width - Style.space(8)
+              spacing: Style.spacing.xs
+              visible: !previewLoader.active || root.previewError !== ""
+
+              Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: root.privacy ? "󱜷" : "󰖠"
+                color: root.faint
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.iconLarge
+              }
+
+              Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideRight
+                text: {
+                  var note = Model.previewNote(root.camera, root.previewEnabled,
+                                               root.opened, root.snapshotRunning)
+                  if (note) return note
+                  // Only reached once nothing is blocking it, so anything left
+                  // is a genuine fault from the camera itself.
+                  if (root.previewError) return root.previewError
+                  if (!root.previewDevice) return "No preview device"
+                  return "Starting…"
+                }
+                color: root.faint
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                visible: text !== ""
+                text: Model.previewHint(root.camera, root.previewEnabled,
+                                        root.opened, root.snapshotRunning)
+                color: root.faint
+                opacity: 0.75
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            // Clicking the preview recenters, which is the one framing action worth
+            // having directly on the image — and now the one control reachable from
+            // every page, since the picture is.
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              acceptedButtons: Qt.LeftButton
+              onClicked: root.home()
+              hoverEnabled: true
+              onEntered: if (root.bar) root.bar.showTooltip(previewFrame, "Click to recenter")
+              onExited: if (root.bar) root.bar.hideTooltip(previewFrame)
+            }
+          }
+        }
+
+        PanelSeparator {
+          width: parent.width
+          foreground: root.foreground
+          visible: root.present
+        }
       }
 
       ScrollView {
         id: scrollArea
-        anchors.fill: parent
+        anchors.top: pinnedColumn.bottom
+        anchors.topMargin: Style.spacing.panelGap
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
         clip: true
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         ScrollBar.vertical.policy: panelColumn.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
@@ -1908,58 +2192,11 @@ Panel {
           width: scrollArea.availableWidth
           spacing: Style.spacing.panelGap
 
-          // ---------- Hero: lens · title/status · privacy switch ----------
-          PanelHero {
-            id: heroRow
-            width: parent.width
-            title: "PIXY"
-            meta: root.loading && !root.everLoaded
-              ? "Looking for the camera"
-              : Model.summary(root.camera)
-            detail: Model.streamLabel(root.camera)
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            iconOpacity: root.present ? 1.0 : 0.5
-
-            // Status only — the switch owns privacy, mouse and keyboard alike.
-            iconComponent: Component {
-              Text {
-                text: Model.barIcon(root.camera)
-                // Same reasoning as barIconColor: the glyph carries the state.
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.display
-              }
-            }
-
-            // The quick lens-cover, and the header's only cursor target.
-            trailingControl: Component {
-              ToggleSwitch {
-                id: privacySwitch
-                checked: root.privacy
-                hasCursor: root.headerHasCursor
-                foreground: root.foreground
-                // Privacy reads as an alert state, not a neutral preference.
-                accent: root.urgent
-                enabled: root.present
-                opacity: enabled ? 1.0 : 0.4
-                onHovered: function(on) { if (on) root.setHeaderCursor() }
-                onToggled: root.togglePrivacy()
-
-                PanelToolTip {
-                  visible: privacySwitch.containsMouse
-                  text: root.privacy ? "Open the lens" : "Close the lens"
-                  fontFamily: root.fontFamily
-                }
-              }
-            }
-          }
-
           // ---------- Nothing found ----------
           Column {
             width: parent.width
             spacing: Style.spacing.lg
-            visible: root.onMainPage && root.everLoaded && !root.present
+            visible: root.page === "frame" && root.everLoaded && !root.present
 
             PanelSeparator { foreground: root.foreground }
 
@@ -1984,11 +2221,11 @@ Panel {
             }
           }
 
-          // ---------- Mode ----------
+          // ---------- FRAME: mode ----------
           Column {
             width: parent.width
             spacing: Style.spacing.md
-            visible: root.onMainPage && root.present
+            visible: root.page === "frame" && root.present
 
             PanelSeparator { foreground: root.foreground }
 
@@ -2002,7 +2239,8 @@ Panel {
               id: modeRow
               width: parent.width
               implicitHeight: modeGroup.implicitHeight + Style.spacing.controlGap
-              hasCursor: root.cursorActive && root.focusSection === "mode" && root.selectedIndex === 0
+              hasCursor: root.cursorActive && root.focusSection === "frame"
+                && root.selectedIndex === root.frameModeRow
               onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(modeRow)
               foreground: root.foreground
               accent: root.accent
@@ -2057,11 +2295,13 @@ Panel {
                 focusable: false
                 cursorIndex: -1
                 onChanged: function(value) { root.setMode(value) }
-                onHovered: function(index, isHovered) { if (isHovered) root.setCursor("mode", 0) }
+                onHovered: function(index, isHovered) {
+                  if (isHovered) root.setCursor("frame", root.frameModeRow)
+                }
               }
 
               HoverHandler {
-                onHoveredChanged: if (hovered) root.setCursor("mode", 0)
+                onHoveredChanged: if (hovered) root.setCursor("frame", root.frameModeRow)
               }
             }
 
@@ -2079,12 +2319,11 @@ Panel {
             }
           }
 
-          // ---------- Framing ----------
+          // ---------- FRAME: aiming ----------
           Column {
-            id: framingColumn
             width: parent.width
             spacing: Style.spacing.md
-            visible: root.onMainPage && root.present
+            visible: root.page === "frame" && root.present
 
             PanelSeparator { foreground: root.foreground }
 
@@ -2107,7 +2346,10 @@ Panel {
               // Labels the switch. A bare switch on a "FRAMING" header would be
               // ambiguous — there are three other things in the section it could
               // plausibly gate — and the eye is doing the work a word would, at
-              // the width a word would not fit in.
+              // the width a word would not fit in. It stays here rather than moving
+              // up next to the pinned picture: the switch decides whether the picture
+              // is drawn at all, and a control anchored to the thing it can make
+              // disappear would be a control that moves when you use it.
               Text {
                 id: previewGlyph
                 text: Model.previewIcon(root.previewEnabled)
@@ -2131,14 +2373,14 @@ Panel {
               ToggleSwitch {
                 id: previewToggle
                 checked: root.previewEnabled
-                hasCursor: root.cursorActive && root.focusSection === "framing"
-                  && root.selectedIndex === 0
+                hasCursor: root.cursorActive && root.focusSection === "frame"
+                  && root.selectedIndex === root.framePreviewRow
                 foreground: root.foreground
                 accent: root.accent
                 anchors.right: parent.right
                 anchors.rightMargin: Style.space(6)
                 anchors.verticalCenter: parent.verticalCenter
-                onHovered: function(on) { if (on) root.setCursor("framing", 0) }
+                onHovered: function(on) { if (on) root.setCursor("frame", root.framePreviewRow) }
                 onToggled: root.togglePreview()
                 // Anchored in a plain Item rather than wrapped in a CursorSurface:
                 // the header row is not a full-width control, and a ring around the
@@ -2170,35 +2412,6 @@ Panel {
                 anchors.rightMargin: Style.spacing.md
                 anchors.verticalCenter: parent.verticalCenter
               }
-            }
-
-            // ---- Preview, or rather the space it belongs in ----
-            //
-            // The picture itself is drawn by previewFrame, outside the scrolling
-            // column — see the note there. This is the hole it sits in while it is
-            // on screen, and it exists so the layout is unchanged by that: same
-            // width, same height, same visibility rule, so the panel is exactly as
-            // tall as it was and everything below stays where it was.
-            //
-            // Deliberately small: this is a framing aid, not a viewer. Big enough
-            // to see where the lens is pointing while the jog pad moves it, and
-            // sitting directly above the pad so aiming is one glance rather than
-            // a glance and a guess.
-            //
-            // 16:9 at a third of the panel height. Any larger and the controls
-            // below it start scrolling out of reach, which costs more than the
-            // extra pixels are worth.
-            // Turned off entirely by the setting, rather than left as an empty
-            // frame: someone who disabled the preview does not want a permanent
-            // reminder of it taking up a third of the panel. Every other blocked
-            // state keeps the frame, because those are temporary and the
-            // placeholder is how the panel explains itself.
-            Item {
-              id: previewSlot
-              visible: root.previewEnabled
-              anchors.horizontalCenter: parent.horizontalCenter
-              width: parent.width - Style.space(12)
-              height: visible ? Math.round(width * Model.PREVIEW_ASPECT) : 0
             }
 
             // ---- Jog pad ----
@@ -2269,7 +2482,7 @@ Panel {
             // ---- Pan / tilt / zoom ----
             AxisRow {
               width: parent.width
-              rowIndex: 1
+              rowIndex: root.framePanRow
               label: "Pan"
               glyph: "󰹳"
               minimum: Model.PAN_MIN
@@ -2282,7 +2495,7 @@ Panel {
 
             AxisRow {
               width: parent.width
-              rowIndex: 2
+              rowIndex: root.frameTiltRow
               label: "Tilt"
               glyph: "󰹹"
               minimum: Model.TILT_MIN
@@ -2295,7 +2508,7 @@ Panel {
 
             AxisRow {
               width: parent.width
-              rowIndex: 3
+              rowIndex: root.frameZoomRow
               label: "Zoom"
               glyph: "󰍉"
               minimum: Model.ZOOM_MIN
@@ -2311,7 +2524,8 @@ Panel {
               id: homeRow
               width: parent.width
               implicitHeight: homeButton.implicitHeight + Style.spacing.controlGap
-              hasCursor: root.cursorActive && root.focusSection === "framing" && root.selectedIndex === 4
+              hasCursor: root.cursorActive && root.focusSection === "frame"
+                && root.selectedIndex === root.frameHomeRow
               onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(homeRow)
               foreground: root.foreground
               accent: root.accent
@@ -2336,32 +2550,66 @@ Panel {
                 accent: root.accent
                 fontFamily: root.fontFamily
                 onClicked: root.home()
-                onHovered: function(on) { if (on) root.setCursor("framing", 4) }
+                onHovered: function(on) { if (on) root.setCursor("frame", root.frameHomeRow) }
               }
             }
           }
 
-          // ---------- Image ----------
+          // ---------- FRAME: presets ----------
+          //
+          // On the FRAME page because a preset *is* framing: it recalls where the lens
+          // points and how far it is zoomed, which is what every other row here does
+          // one axis at a time. They were on the same page before too — the page just
+          // used to hold everything.
+          Column {
+            width: parent.width
+            spacing: Style.spacing.sm
+            visible: root.page === "frame" && root.present
+
+            PanelSeparator { foreground: root.foreground }
+
+            PanelSectionHeader {
+              text: "PRESETS"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Repeater {
+              model: Model.PRESET_SLOTS
+
+              PresetRow {
+                required property var modelData
+                required property int index
+                width: panelColumn.width
+                slot: modelData
+                rowIndex: root.framePresetRow + index
+              }
+            }
+          }
+
+          // ---------- IMAGE ----------
           //
           // The picture controls, and the section that most justifies this widget
           // existing at all: these are UVC control ioctls, so they keep working
           // while another app holds the capture stream. Fixing a washed-out
           // picture mid-call is a thing you do *in* the call.
           //
-          // Five sliders and the white balance pair here; everything with a
-          // narrower audience — hue, gain, exposure, focus, mains frequency,
-          // backlight — lives behind the cog. The split is by how often you reach
-          // for it, not by difficulty: exposure is not hard to understand, it is
-          // just not something you touch twice a week.
+          // One list of every control the driver answered for. There used to be a
+          // curated five here and the rest behind a cog, split by how often you reach
+          // for a control rather than by difficulty — and the reason for that split
+          // was panel length, not the controls. A page holds all of them, so the cog
+          // and the "advanced" half are gone. Nobody has to be told which controls
+          // are the ordinary ones.
           //
           // Hidden rather than disabled when there are no controls, on the same
           // reasoning as the mic section: a greyed-out slider stack on a camera
           // whose controls could not be read is a permanent lie, and the failure
-          // is already carried by the header's summary.
+          // is already carried by the header's summary. The tab goes with it — see
+          // visiblePages.
           Column {
             width: parent.width
             spacing: Style.spacing.md
-            visible: root.onMainPage && root.present && root.hasImage
+            visible: root.page === "image" && root.present && root.hasImage
 
             PanelSeparator { foreground: root.foreground }
 
@@ -2369,8 +2617,7 @@ Panel {
               width: parent.width
               implicitHeight: Math.max(Math.max(imageHeader.implicitHeight,
                                                 imageValue.implicitHeight),
-                                       Math.max(imageResetButton.implicitHeight,
-                                                imageCogButton.implicitHeight))
+                                       imageResetButton.implicitHeight)
 
               PanelSectionHeader {
                 id: imageHeader
@@ -2397,8 +2644,6 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
               }
 
-              // Reset before the cog, so the two header actions read
-              // destructive-then-more rather than the reverse.
               PanelActionButton {
                 id: imageResetButton
                 iconText: "󰦛"
@@ -2413,43 +2658,176 @@ Panel {
                 opacity: enabled ? 1.0 : 0.35
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                anchors.right: imageCogButton.left
-                anchors.rightMargin: Style.spacing.xs
-                anchors.verticalCenter: parent.verticalCenter
-                onClicked: root.resetImage()
-              }
-
-              PanelActionButton {
-                id: imageCogButton
-                iconText: "󰒓"
-                tooltipText: "Advanced controls and image profiles"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
                 anchors.right: parent.right
                 anchors.rightMargin: Style.space(6)
                 anchors.verticalCenter: parent.verticalCenter
-                onClicked: root.openImageAdvanced()
+                onClicked: root.resetImage()
               }
             }
 
-            // One row per control the helper marked curated, in the helper's
-            // order — which is editorial: an auto switch below the slider it
-            // gates reads backwards.
+            // One row per control, in the helper's order — which is editorial: an
+            // auto switch below the slider it gates reads backwards.
             Repeater {
-              model: root.curatedImage
+              model: root.imageControls
 
               ControlRow {
                 required property var modelData
                 required property int index
                 width: panelColumn.width
                 control: modelData
-                rowIndex: index
+                rowIndex: root.imageControlRow + index
                 section: "image"
               }
             }
+
+            // ---- Image profiles ----
+            //
+            // Deliberately separate from the framing presets, and stored under a
+            // different key in the same file: a framing preset recalls where the
+            // lens points, a profile recalls how the picture looks, and neither
+            // should silently change the other. Which is also why they are on
+            // different pages — the two lists look alike enough that side by side
+            // they would invite exactly that confusion.
+            //
+            // Named rather than numbered, because these are things like "Evening"
+            // and "Bright room" — a name is the point, which is also why saving one
+            // needs a text field and a framing preset does not.
+            //
+            // A profile captures *every* control, curated or not, so one saved
+            // after setting the exposure by hand restores the exposure too.
+            PanelSeparator { foreground: root.foreground }
+
+            Item {
+              width: parent.width
+              implicitHeight: profilesHeader.implicitHeight
+
+              PanelSectionHeader {
+                id: profilesHeader
+                text: "IMAGE PROFILES"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                visible: root.imageProfiles.length === 0
+                text: "None saved"
+                color: root.faint
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            Repeater {
+              model: root.imageProfiles
+
+              ProfileRow {
+                required property var modelData
+                required property int index
+                width: panelColumn.width
+                name: modelData
+                rowIndex: root.imageProfileRow + index
+              }
+            }
+
+            // ---- Save the current picture ----
+            CursorSurface {
+              id: saveRow
+              width: parent.width
+              implicitHeight: saveInner.implicitHeight + Style.spacing.controlGap
+              hasCursor: root.cursorActive && root.focusSection === "image"
+                && root.selectedIndex === root.imageSaveRow
+              onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(saveRow)
+              foreground: root.foreground
+              accent: root.accent
+              outline: true
+
+              Item {
+                id: saveInner
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.leftMargin: Style.space(6)
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                implicitHeight: Math.max(profileField.implicitHeight,
+                                         profileSaveButton.implicitHeight)
+
+                TextField {
+                  id: profileField
+                  anchors.left: parent.left
+                  anchors.right: profileSaveButton.left
+                  anchors.rightMargin: Style.spacing.sm
+                  anchors.verticalCenter: parent.verticalCenter
+                  placeholderText: "Name this picture"
+                  // The draft lives on the root, so the name survives this field
+                  // being destroyed when the page changes, and the button and the
+                  // field cannot disagree about what is being saved.
+                  text: root.profileDraft
+                  onTextChanged: root.profileDraft = text
+                  hasCursor: root.cursorActive && root.focusSection === "image"
+                    && root.selectedIndex === root.imageSaveRow
+                  foreground: root.foreground
+                  accent: root.accent
+                  verticalPadding: Style.spacing.xxs
+                  onAccepted: root.saveProfile(root.profileDraft)
+                  // Esc hands the keyboard back to the panel rather than closing
+                  // anything: the field has the keys while it is focused, so it is
+                  // the only thing that can give them up.
+                  Keys.onEscapePressed: function(event) {
+                    keyCatcher.forceActiveFocus()
+                    event.accepted = true
+                  }
+                  onHoveredChanged: if (hovered) root.setCursor("image", root.imageSaveRow)
+                }
+
+                Button {
+                  id: profileSaveButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  // Says what pressing it does. The helper would overwrite either
+                  // way, so the word is the only warning there is.
+                  text: root.profileDraftState === "exists" ? "Overwrite" : "Save"
+                  iconText: "󰆓"
+                  bordered: true
+                  enabled: root.present && root.profileDraftState !== "blank"
+                  opacity: enabled ? 1.0 : 0.45
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  horizontalPadding: Style.spacing.sm
+                  verticalPadding: Style.spacing.xxs
+                  onClicked: root.saveProfile(root.profileDraft)
+                  onHovered: function(on) {
+                    if (on) root.setCursor("image", root.imageSaveRow)
+                  }
+                }
+              }
+
+              HoverHandler {
+                onHoveredChanged: if (hovered) root.setCursor("image", root.imageSaveRow)
+              }
+            }
+
+            // Why a profile can carry a value that does not land. Shown rather
+            // than hidden because it is the one thing about profiles that is not
+            // obvious, and finding out by having a recall silently do nothing is
+            // the worst way to learn it.
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "A profile stores every control above. Values held by an auto switch are saved, but only take effect once that switch is off."
+              color: root.faint
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
           }
 
-          // ---------- Microphone ----------
+          // ---------- MIC ----------
           //
           // The camera has a mic, and on a call it is usually the mic being used,
           // so muting it belongs next to closing the lens rather than two panels
@@ -2462,7 +2840,7 @@ Panel {
           Column {
             width: parent.width
             spacing: Style.spacing.md
-            visible: root.onMainPage && root.present && root.hasMic
+            visible: root.page === "mic" && root.present && root.hasMic
 
             PanelSeparator { foreground: root.foreground }
 
@@ -2598,363 +2976,49 @@ Panel {
             }
           }
 
-          // ---------- Presets ----------
-          Column {
-            width: parent.width
-            spacing: Style.spacing.sm
-            visible: root.onMainPage && root.present
-
-            PanelSeparator { foreground: root.foreground }
-
-            PanelSectionHeader {
-              text: "PRESETS"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Repeater {
-              model: Model.PRESET_SLOTS
-
-              PresetRow {
-                required property var modelData
-                required property int index
-                width: panelColumn.width
-                slot: modelData
-                rowIndex: index
-              }
-            }
-          }
-
-          // ---------- Advanced image controls ----------
+          // ---------- SETTINGS ----------
           //
-          // A view rather than a nested popup. The advanced controls are the same
-          // IMAGE section seen closer up, and a second window would hide the panel
-          // behind it while giving the cursor two lists to be in at once. Swapping
-          // the body keeps one cursor over one visible list, which is the whole
-          // reason the keyboard model here is simple.
+          // The camera's own firmware settings: the microphone's DSP mode, the mirror
+          // flips, the idle shutter. A page of their own because they are a different
+          // kind of thing from everything else here — settings stored *in* the camera,
+          // which follow it to another machine, rather than V4L2 controls or shell
+          // preferences that belong to this host.
           //
-          // The framing presets deliberately stay on the main page. They are a
-          // different kind of thing — pan/tilt/zoom, not picture — and recalling
-          // one must not change the image, so putting the two lists side by side
-          // would invite exactly the confusion the split exists to prevent.
+          // It used to be reached from an entry row on the main page and left by a
+          // Back row at the top of this one. Both are gone: it is a tab, so the way in
+          // and the way out are the same two keys as every other page.
+          //
+          // Row order is the drawn order and the cursor order both, and every row
+          // takes its index from the settingsXRow properties rather than a literal —
+          // the arithmetic there chains off the Model lists, so the two cannot drift
+          // apart when a toggle is added.
           Column {
             width: parent.width
             spacing: Style.spacing.md
-            visible: root.imageAdvanced
+            visible: root.page === "settings" && root.present
 
-            // Back is the first row drawn and the first row the cursor visits, so
-            // k from the top control reaches it and j walks the page downward.
-            CursorSurface {
-              id: backRow
-              width: parent.width
-              implicitHeight: backButton.implicitHeight + Style.spacing.controlGap
-              hasCursor: root.cursorActive && root.focusSection === "advanced"
-                && root.selectedIndex === root.advancedBackRow
-              onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(backRow)
-              foreground: root.foreground
-              accent: root.accent
-              outline: true
-
-              Button {
-                id: backButton
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Back"
-                iconText: "󰅁"
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
-                onClicked: root.closeImageAdvanced()
-                onHovered: function(on) {
-                  if (on) root.setCursor("advanced", root.advancedBackRow)
-                }
-              }
-
-              Text {
-                text: Model.imageSummary(root.imageControls)
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-              }
-            }
-
-            PanelSeparator { foreground: root.foreground }
-
-            PanelSectionHeader {
-              text: "ADVANCED"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            // The same ControlRow the main page uses. Nothing about these controls
-            // is structurally different — they are here because they are reached
-            // for less often, not because they behave unlike a slider.
-            Repeater {
-              model: root.advancedImage
-
-              ControlRow {
-                required property var modelData
-                required property int index
-                width: panelColumn.width
-                control: modelData
-                rowIndex: root.advancedControlRow + index
-                section: "advanced"
-              }
-            }
-
-            // ---- Image profiles ----
-            //
-            // Deliberately separate from the framing presets, and stored under a
-            // different key in the same file: a framing preset recalls where the
-            // lens points, a profile recalls how the picture looks, and neither
-            // should silently change the other.
-            //
-            // Named rather than numbered, because these are things like "Evening"
-            // and "Bright room" — a name is the point, which is also why saving one
-            // needs a text field and a framing preset does not.
-            //
-            // A profile captures *every* control, curated or not, so one saved
-            // after setting the exposure by hand restores the exposure too.
             PanelSeparator { foreground: root.foreground }
 
             Item {
               width: parent.width
-              implicitHeight: profilesHeader.implicitHeight
+              implicitHeight: Math.max(settingsHeader.implicitHeight,
+                                       settingsStatus.implicitHeight)
 
               PanelSectionHeader {
-                id: profilesHeader
-                text: "IMAGE PROFILES"
+                id: settingsHeader
+                text: "CAMERA SETTINGS"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-              }
-
-              Text {
-                visible: root.imageProfiles.length === 0
-                text: "None saved"
-                color: root.faint
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-              }
-            }
-
-            Repeater {
-              model: root.imageProfiles
-
-              ProfileRow {
-                required property var modelData
-                required property int index
-                width: panelColumn.width
-                name: modelData
-                rowIndex: root.advancedProfileRow + index
-              }
-            }
-
-            // ---- Save the current picture ----
-            CursorSurface {
-              id: saveRow
-              width: parent.width
-              implicitHeight: saveInner.implicitHeight + Style.spacing.controlGap
-              hasCursor: root.cursorActive && root.focusSection === "advanced"
-                && root.selectedIndex === root.advancedSaveRow
-              onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(saveRow)
-              foreground: root.foreground
-              accent: root.accent
-              outline: true
-
-              Item {
-                id: saveInner
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.leftMargin: Style.space(6)
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                implicitHeight: Math.max(profileField.implicitHeight,
-                                         profileSaveButton.implicitHeight)
-
-                TextField {
-                  id: profileField
-                  anchors.left: parent.left
-                  anchors.right: profileSaveButton.left
-                  anchors.rightMargin: Style.spacing.sm
-                  anchors.verticalCenter: parent.verticalCenter
-                  placeholderText: "Name this picture"
-                  // The draft lives on the root, so the name survives this field
-                  // being destroyed when the view closes and the button and the
-                  // field cannot disagree about what is being saved.
-                  text: root.profileDraft
-                  onTextChanged: root.profileDraft = text
-                  hasCursor: root.cursorActive && root.focusSection === "advanced"
-                    && root.selectedIndex === root.advancedSaveRow
-                  foreground: root.foreground
-                  accent: root.accent
-                  verticalPadding: Style.spacing.xxs
-                  onAccepted: root.saveProfile(root.profileDraft)
-                  // Esc hands the keyboard back to the panel rather than closing
-                  // anything: the field has the keys while it is focused, so it is
-                  // the only thing that can give them up.
-                  Keys.onEscapePressed: function(event) {
-                    keyCatcher.forceActiveFocus()
-                    event.accepted = true
-                  }
-                  onHoveredChanged: if (hovered) root.setCursor("advanced", root.advancedSaveRow)
-                }
-
-                Button {
-                  id: profileSaveButton
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  // Says what pressing it does. The helper would overwrite either
-                  // way, so the word is the only warning there is.
-                  text: root.profileDraftState === "exists" ? "Overwrite" : "Save"
-                  iconText: "󰆓"
-                  bordered: true
-                  enabled: root.present && root.profileDraftState !== "blank"
-                  opacity: enabled ? 1.0 : 0.45
-                  foreground: root.foreground
-                  accent: root.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  horizontalPadding: Style.spacing.sm
-                  verticalPadding: Style.spacing.xxs
-                  onClicked: root.saveProfile(root.profileDraft)
-                  onHovered: function(on) {
-                    if (on) root.setCursor("advanced", root.advancedSaveRow)
-                  }
-                }
-              }
-
-              HoverHandler {
-                onHoveredChanged: if (hovered) root.setCursor("advanced", root.advancedSaveRow)
-              }
-            }
-
-            // Why a profile can carry a value that does not land. Shown rather
-            // than hidden because it is the one thing about profiles that is not
-            // obvious, and finding out by having a recall silently do nothing is
-            // the worst way to learn it.
-            Text {
-              width: parent.width
-              wrapMode: Text.WordWrap
-              text: "A profile stores every control above. Values held by an auto switch are saved, but only take effect once that switch is off."
-              color: root.faint
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          // ---------- Camera settings entry ----------
-          //
-          // Its own row rather than a cog on a section header, which is where the
-          // advanced image view is reached from. The difference is what the page
-          // holds: the cog above IMAGE opens more of IMAGE, while this opens the
-          // camera's own firmware — the microphone's DSP mode, the mirror flips, the
-          // idle shutter — which belongs to no section on this page. A cog on
-          // PRESETS would have implied it was more presets.
-          Column {
-            width: parent.width
-            spacing: Style.spacing.sm
-            visible: root.onMainPage && root.present
-
-            PanelSeparator { foreground: root.foreground }
-
-            CursorSurface {
-              id: cameraRow
-              width: parent.width
-              implicitHeight: cameraRowButton.implicitHeight + Style.spacing.controlGap
-              hasCursor: root.cursorActive && root.focusSection === "camera"
-                && root.selectedIndex === 0
-              onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(cameraRow)
-              foreground: root.foreground
-              accent: root.accent
-              outline: true
-
-              Button {
-                id: cameraRowButton
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.leftMargin: Style.space(6)
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Camera settings"
-                iconText: "󰘚"
-                leftAlign: true
-                bordered: true
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
-                onClicked: root.openDevicePage()
-                onHovered: function(on) { if (on) root.setCursor("camera", 0) }
-
-                PanelToolTip {
-                  visible: cameraRowButton.hot
-                  text: "Microphone mode, gestures, mirroring, focus, snapshots"
-                  fontFamily: root.fontFamily
-                }
-              }
-            }
-          }
-
-          // ---------- Device page ----------
-          //
-          // The camera's own firmware settings, on a page of their own for the same
-          // reason the advanced image view is a page: one cursor over one visible
-          // list. It is a separate page from that one because these are a different
-          // kind of thing — settings stored in the camera, which follow it to
-          // another machine, rather than V4L2 controls that belong to this host.
-          //
-          // Row order is the drawn order and the cursor order both, and every row
-          // takes its index from the deviceXRow properties rather than a literal —
-          // the arithmetic there chains off the Model lists, so the two cannot
-          // drift apart when a toggle is added.
-          Column {
-            width: parent.width
-            spacing: Style.spacing.md
-            visible: root.devicePage
-
-            // Back first, as in the advanced view: k from the first control reaches
-            // it and j walks the page downward.
-            CursorSurface {
-              id: deviceBackRowSurface
-              width: parent.width
-              implicitHeight: deviceBackButton.implicitHeight + Style.spacing.controlGap
-              hasCursor: root.cursorActive && root.focusSection === "device"
-                && root.selectedIndex === root.deviceBackRow
-              onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(deviceBackRowSurface)
-              foreground: root.foreground
-              accent: root.accent
-              outline: true
-
-              Button {
-                id: deviceBackButton
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Back"
-                iconText: "󰅁"
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
-                onClicked: root.closeDevicePage()
-                onHovered: function(on) {
-                  if (on) root.setCursor("device", root.deviceBackRow)
-                }
               }
 
               // Says the read is happening, because it takes about six tenths of a
               // second: eleven HID queries sharing one descriptor. Without this the
-              // page opens showing rows that are all "not reported" and then
-              // silently fills in, which reads as a page that failed and recovered.
+              // page opens showing rows that are all "not reported" and then silently
+              // fills in, which reads as a page that failed and recovered.
               Text {
+                id: settingsStatus
                 text: root.vendorLoading
                   ? "Reading the camera…"
                   : Model.nativePresetSummary(root.vendorShown)
@@ -2966,14 +3030,6 @@ Panel {
                 anchors.rightMargin: Style.space(6)
                 anchors.verticalCenter: parent.verticalCenter
               }
-            }
-
-            PanelSeparator { foreground: root.foreground }
-
-            PanelSectionHeader {
-              text: "CAMERA SETTINGS"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
             }
 
             // Why there is nothing to show. The rows below stay drawn either way —
@@ -2992,7 +3048,7 @@ Panel {
 
             DeviceChipRow {
               width: parent.width
-              rowIndex: root.deviceAudioRow
+              rowIndex: root.settingsAudioRow
               glyph: "󰍯"
               label: "Microphone mode"
               options: Model.AUDIO_MODES
@@ -3004,7 +3060,7 @@ Panel {
 
             DeviceSwitchRow {
               width: parent.width
-              rowIndex: root.deviceGestureRow
+              rowIndex: root.settingsGestureRow
               glyph: "󰟋"
               label: "Gesture control"
               note: "Lets a raised hand start and stop the camera's own tracking."
@@ -3015,7 +3071,7 @@ Panel {
 
             DeviceChipRow {
               width: parent.width
-              rowIndex: root.deviceFocusRow
+              rowIndex: root.settingsFocusRow
               glyph: "󰋱"
               label: "Focus target"
               options: Model.FOCUS_TARGETS
@@ -3032,11 +3088,12 @@ Panel {
             // other target uses — and the camera keeps the last one in those bytes,
             // so a pad shown under Face would be aiming something inert.
             //
-            // A pad rather than the preview itself. The preview is on the main page
-            // and this is not, and putting the click there would mean either
-            // duplicating the preview here or sending someone back a page to aim
-            // something they cannot see from there. The pad shows the current point,
-            // which is the part that was missing.
+            // A pad rather than the preview itself, even though the preview is now
+            // pinned above this page too: a click on the picture already recenters,
+            // and one image that means "aim the focus spot" on one page and "recenter"
+            // on the others would be worse than a second, smaller pad that only ever
+            // means one thing. The pad also shows the current point, which the picture
+            // cannot.
             Item {
               width: parent.width
               visible: Model.focusSpot(root.vendorShown.metering) !== null
@@ -3101,7 +3158,7 @@ Panel {
                 required property var modelData
                 required property int index
                 width: panelColumn.width
-                rowIndex: root.deviceFeatureRow + index
+                rowIndex: root.settingsFeatureRow + index
                 glyph: index === 0 ? "󱃧" : (index === 1 ? "󱃨" : "󰑤")
                 label: modelData.label
                 note: modelData.note
@@ -3113,7 +3170,7 @@ Panel {
 
             DeviceChipRow {
               width: parent.width
-              rowIndex: root.deviceAutoPrivacyRow
+              rowIndex: root.settingsAutoPrivacyRow
               glyph: "󱨔"
               label: "Close the lens when idle"
               options: Model.autoPrivacyOptions()
@@ -3164,7 +3221,7 @@ Panel {
                 required property var modelData
                 required property int index
                 width: panelColumn.width
-                rowIndex: root.deviceCallRow + index
+                rowIndex: root.settingsCallRow + index
                 glyph: index === 0 ? "󰄄" : (index === 1 ? "󰶑" : "󰍬")
                 label: modelData.label
                 note: modelData.note
@@ -3201,8 +3258,8 @@ Panel {
               id: snapshotRowSurface
               width: parent.width
               implicitHeight: snapshotContent.implicitHeight + Style.spacing.controlGap
-              hasCursor: root.cursorActive && root.focusSection === "device"
-                && root.selectedIndex === root.deviceSnapshotRow
+              hasCursor: root.cursorActive && root.focusSection === "settings"
+                && root.selectedIndex === root.settingsSnapshotRow
               onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(snapshotRowSurface)
               foreground: root.foreground
               accent: root.accent
@@ -3231,7 +3288,7 @@ Panel {
                   fontFamily: root.fontFamily
                   onClicked: root.takeSnapshot()
                   onHovered: function(on) {
-                    if (on) root.setCursor("device", root.deviceSnapshotRow)
+                    if (on) root.setCursor("settings", root.settingsSnapshotRow)
                   }
                 }
 
@@ -3258,7 +3315,7 @@ Panel {
               }
 
               HoverHandler {
-                onHoveredChanged: if (hovered) root.setCursor("device", root.deviceSnapshotRow)
+                onHoveredChanged: if (hovered) root.setCursor("settings", root.settingsSnapshotRow)
               }
             }
 
@@ -3278,8 +3335,8 @@ Panel {
               // is the question three numbered slots on a second page raises. The
               // zoom part is the reason the framing presets exist at all.
               text: "The camera's own three slots, shared with EMEET Studio. They hold"
-                + " pan and tilt only, so the framing presets on the main page keep"
-                + " the zoom as well and write these at the same time."
+                + " pan and tilt only, so the presets on the FRAME page keep the zoom"
+                + " as well and write these at the same time."
               color: root.faint
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -3293,17 +3350,17 @@ Panel {
                 required property int index
                 width: panelColumn.width
                 slot: modelData
-                rowIndex: root.deviceNativeRow + index
+                rowIndex: root.settingsNativeRow + index
               }
             }
 
             // ---- Capture formats ----
             //
             // Read-only, and last on the page for that reason: it is the one block
-            // here that sets nothing. Worth showing anyway — "what can this camera
-            // actually do" is a question people ask of a webcam, and the answer is
-            // otherwise only in `v4l2-ctl`, which this plugin deliberately does not
-            // depend on.
+            // here that sets nothing, which is also why it has no cursor row. Worth
+            // showing anyway — "what can this camera actually do" is a question people
+            // ask of a webcam, and the answer is otherwise only in `v4l2-ctl`, which
+            // this plugin deliberately does not depend on.
             PanelSeparator { foreground: root.foreground }
 
             PanelSectionHeader {
@@ -3386,271 +3443,15 @@ Panel {
               color: root.faint
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
-              // Per page, because the keys differ: 1-3 and the framing presets do
-              // not exist behind the cog, and a hint line listing keys that do
-              // nothing on the visible page is worse than none.
-              text: {
-                if (root.imageAdvanced)
-                  return "j/k move · h/l adjust · enter recall · s name · x clear · esc back · i close · r refresh"
-                if (root.devicePage)
-                  return "j/k move · h/l change · enter toggle · x clear slot · esc back · d close"
-                var keys = "j/k move · h/l adjust · 1-3 recall · s save · x clear · p privacy · t tracking"
-                if (root.hasMic) keys += " · m mute"
-                keys += " · v preview · c recenter"
-                if (root.hasImage) keys += " · i advanced"
-                return keys + " · d camera · r refresh"
-              }
+              // Per page, because the keys differ, and Model owns the wording — a
+              // hint line naming a key that does nothing on the page in front of you
+              // is worse than no hint at all. See pageHints.
+              text: Model.pageHints(root.page, { hasMic: root.hasMic })
             }
           }
         }
       }
 
-      // ---------------------------------------------------------------- preview
-      //
-      // *(reported)* "since it is longer than the containing box there is no way to
-      // see the preview window when adjusting most of the settings" — which is the
-      // whole point of half of them. Mirroring, the focus target, brightness and the
-      // image sliders are all settings you judge by looking at the picture, and the
-      // picture was at the top of a panel that had grown two pages taller than the
-      // box it lives in.
-      //
-      // So the preview is drawn here, a sibling of the ScrollView rather than a row
-      // inside it: it sits in its slot in FRAMING while that slot is on screen, and
-      // shrinks into a corner of the viewport once the slot scrolls past the top.
-      // Model.previewDock does the arithmetic; this only draws where it says.
-      //
-      // One camera and one VideoOutput throughout. Re-parenting or duplicating it
-      // would mean two objects wanting the same /dev/videoN, and the second would
-      // fail with EBUSY against the first — the panel's own preview competing with
-      // itself, which is the failure this widget spends the most care avoiding.
-      //
-      // Outside the ScrollView, so the docked picture is not clipped by it and does
-      // not scroll. Inside the key catcher, so it is above the panel's content and
-      // below nothing — a floating preview under the rows would be invisible, which
-      // is the state being fixed.
-      Item {
-        id: previewLayer
-        anchors.fill: parent
-        // Nothing to draw when the setting is off, and nothing to draw on either
-        // sub-page: the slot lives in FRAMING, which those pages replace. Docking it
-        // there anyway was tempting — the device page's mirror and focus rows are
-        // exactly where a picture helps — but it would cover the rows it is meant to
-        // help with, on a page with no framing controls to relate it to.
-        visible: root.previewEnabled && root.onMainPage && root.present
-
-        // The slot's top edge in viewport coordinates, and the one binding that makes
-        // the whole thing move.
-        //
-        // Summed from the three y positions between the slot and the scrolled column
-        // rather than taken from mapToItem, which would be shorter and would not
-        // update: mapToItem is a plain function call, so a binding that used it would
-        // only re-evaluate when something else it read changed. Adding the positions
-        // by name is what subscribes this to both scrolling and relayout — a mic node
-        // appearing above the slot moves it just as surely as a scroll does.
-        readonly property real slotY: previewSlot.visible
-          ? panelColumn.y + framingColumn.y + previewSlot.y - scrollOffset
-          : 0
-
-        // Kept separate because it is the one value that has to be read off the
-        // Flickable, and the ScrollView's contentItem is typed as a plain Item —
-        // so this is also where the guard for "before the view exists" belongs.
-        readonly property real scrollOffset: {
-          var flick = scrollArea.contentItem
-          return flick && flick.contentY !== undefined ? flick.contentY : 0
-        }
-
-        readonly property var dock: Model.previewDock({
-          y: previewLayer.slotY,
-          height: previewSlot.height,
-          width: previewSlot.width,
-          available: previewSlot.visible
-        }, {
-          width: previewLayer.width,
-          height: previewLayer.height,
-          inset: Style.space(10),
-          // Model owns the fraction and the reasoning for it — see
-          // PREVIEW_DOCK_FRACTION, and *(reported)* "the preview window is too small".
-          miniWidth: Math.round(previewLayer.width * Model.PREVIEW_DOCK_FRACTION),
-          // Below this the placeholder keeps its glyph and drops its sentence. Stated
-          // in the theme's own units so a large font scale reaches the threshold at
-          // the same apparent size a small one does — the question is whether a line
-          // of text fits, and that is a question about the font.
-          compactBelow: Style.space(200),
-          corner: "top"
-        })
-
-        Rectangle {
-          id: previewFrame
-          x: previewLayer.dock.x
-          y: previewLayer.dock.y
-          width: previewLayer.dock.width
-          height: previewLayer.dock.height
-          radius: Style.cornerRadius
-          color: Qt.darker(root.bar ? root.bar.background : Color.background, 1.3)
-          // The docked picture floats over the rows below it, so it needs an edge
-          // that separates it from them — the accent while docked, the ordinary
-          // faint outline while it is in its slot and the layout does that job.
-          // hoverBorderWidth rather than a number: it is the theme's own "this one
-          // is emphasised" width, the same one the cursor ring uses.
-          border.width: previewLayer.dock.docked
-            ? Style.hoverBorderWidth : Style.normalBorderWidth
-          border.color: previewLayer.dock.docked ? root.accent : root.faint
-
-          // Only the shrink is animated, and only lightly. The position follows the
-          // scroll directly — an eased x/y would lag the finger and read as the
-          // picture sliding around on its own.
-          Behavior on border.width { NumberAnimation { duration: 120 } }
-          Behavior on border.color { ColorAnimation { duration: 120 } }
-
-          // Enough to lift it off the content it covers. Free where it costs
-          // nothing: no shadow while the picture is in its slot, because there is
-          // nothing underneath for it to be lifted off.
-          layer.enabled: previewLayer.dock.docked
-          opacity: previewLayer.dock.docked ? 0.97 : 1.0
-
-          // The video is clipped by this inset child rather than by the frame
-          // itself, and the inset is what makes the border survive.
-          //
-          // *(observed)* `clip: true` on the bordered Rectangle scissored away
-          // its own top border row. The frame's top edge lands on a fractional
-          // device row at 1.25x scale — 214.4 — while its bottom lands on a
-          // whole one, so the scissor rect rounds inward at the top only and
-          // eats the 1px border there. Three sides drawn and one missing, which
-          // is how it was reported.
-          //
-          // Live video hid it: the picture is painted over that row, so the bug
-          // was only visible with the lens closed or the camera busy — the
-          // states where the frame is empty and its outline is the only thing
-          // there. Clipping a child inset by the border width keeps the scissor
-          // rect strictly inside the border instead of on top of it, so no
-          // rounding direction can clip it.
-          Item {
-            id: previewClip
-            anchors.fill: parent
-            anchors.margins: previewFrame.border.width
-            clip: true
-
-            // The Camera lives inside a Loader, and this is not a lazy-init
-            // nicety: assigning `cameraDevice` opens /dev/videoN and holds the
-            // fd for as long as the object exists, whether or not it is
-            // `active`. A permanently-instantiated Camera therefore keeps an
-            // open handle on the webcam from shell startup — which is exactly
-            // the thing a privacy-facing widget must not do. Unloading it is
-            // what actually releases the device.
-            Loader {
-              id: previewLoader
-              anchors.fill: parent
-              active: root.previewWanted && root.previewDevice !== null
-
-              sourceComponent: Component {
-                Item {
-                  CaptureSession {
-                    camera: liveCamera
-                    videoOutput: liveOutput
-                  }
-
-                  Camera {
-                    id: liveCamera
-                    active: true
-                    cameraDevice: root.previewDevice
-                    // Left unset if no suitable format was found, rather than
-                    // assigned null: Qt then picks its own, which is worse
-                    // than pinned but better than refusing to start.
-                    cameraFormat: root.previewFormat ? root.previewFormat : cameraFormat
-                    onErrorOccurred: function(error, errorString) {
-                      // A camera held by a meeting app is the common case and
-                      // is not worth a scary message, so the overlay below
-                      // states it plainly and the panel carries on.
-                      root.previewError = errorString || "preview unavailable"
-                    }
-                  }
-
-                  VideoOutput {
-                    id: liveOutput
-                    anchors.fill: parent
-                    fillMode: VideoOutput.PreserveAspectCrop
-                    visible: root.previewError === ""
-                  }
-                }
-              }
-            }
-          }
-
-          // Stands in for the image whenever there is nothing to show, so
-          // the space never reads as a broken video element. Saying why is
-          // the whole point: a blank preview during a call is otherwise
-          // indistinguishable from a broken widget.
-          Column {
-            anchors.centerIn: parent
-            width: parent.width - Style.space(8)
-            spacing: Style.spacing.xs
-            visible: !previewLoader.active || root.previewError !== ""
-
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              text: root.privacy ? "󱜷" : "󰖠"
-              color: root.faint
-              font.family: root.fontFamily
-              font.pixelSize: previewLayer.dock.compact
-                ? Style.font.icon : Style.font.iconLarge
-            }
-
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              width: parent.width
-              horizontalAlignment: Text.AlignHCenter
-              elide: Text.ElideRight
-              text: {
-                var note = Model.previewNote(root.camera, root.previewEnabled,
-                                             root.opened, root.snapshotRunning)
-                if (note) return note
-                // Only reached once nothing is blocking it, so anything left
-                // is a genuine fault from the camera itself.
-                if (root.previewError) return root.previewError
-                if (!root.previewDevice) return "No preview device"
-                return "Starting…"
-              }
-              color: root.faint
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              width: parent.width
-              horizontalAlignment: Text.AlignHCenter
-              wrapMode: Text.WordWrap
-              // Dropped once the picture is small: a sentence wrapped to four
-              // lines inside a thumbnail is not a sentence anyone reads, and the
-              // note above it already names the reason.
-              visible: text !== "" && !previewLayer.dock.compact
-              text: Model.previewHint(root.camera, root.previewEnabled,
-                                      root.opened, root.snapshotRunning)
-              color: root.faint
-              opacity: 0.75
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          // Clicking the preview recenters, which is the one framing action
-          // worth having directly on the image. Docked it does the same thing —
-          // the picture means the same wherever it is drawn — and the tooltip is
-          // the only part that changes, because a floating thumbnail has to say
-          // what it is before it says what clicking it does.
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            acceptedButtons: Qt.LeftButton
-            onClicked: root.home()
-            hoverEnabled: true
-            onEntered: if (root.bar) root.bar.showTooltip(previewFrame,
-              previewLayer.dock.docked ? "Live preview · click to recenter"
-                                       : "Click to recenter")
-            onExited: if (root.bar) root.bar.hideTooltip(previewFrame)
-          }
-        }
-      }
     }
   }
 
@@ -3673,7 +3474,7 @@ Panel {
     signal axisMoved(int value)
 
     implicitHeight: axisSlider.implicitHeight + Style.spacing.controlGap
-    hasCursor: root.cursorActive && root.focusSection === "framing" && root.selectedIndex === rowIndex
+    hasCursor: root.cursorActive && root.focusSection === "frame" && root.selectedIndex === rowIndex
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(axisRow)
     foreground: root.foreground
     accent: root.accent
@@ -3754,7 +3555,7 @@ Panel {
     }
 
     HoverHandler {
-      onHoveredChanged: if (hovered) root.setCursor("framing", axisRow.rowIndex)
+      onHoveredChanged: if (hovered) root.setCursor("frame", axisRow.rowIndex)
     }
   }
 
@@ -4029,7 +3830,7 @@ Panel {
     required property int rowIndex
 
     implicitHeight: profileInner.implicitHeight + Style.spacing.lg
-    hasCursor: root.cursorActive && root.focusSection === "advanced"
+    hasCursor: root.cursorActive && root.focusSection === "image"
       && root.selectedIndex === rowIndex
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(profileRow)
     foreground: root.foreground
@@ -4043,7 +3844,7 @@ Panel {
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
-      onContainsMouseChanged: if (containsMouse) root.setCursor("advanced", profileRow.rowIndex)
+      onContainsMouseChanged: if (containsMouse) root.setCursor("image", profileRow.rowIndex)
       onClicked: root.loadProfile(profileRow.name)
     }
 
@@ -4107,12 +3908,12 @@ Panel {
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         onClicked: root.clearProfile(profileRow.name)
-        onHovered: function(on) { if (on) root.setCursor("advanced", profileRow.rowIndex) }
+        onHovered: function(on) { if (on) root.setCursor("image", profileRow.rowIndex) }
       }
     }
   }
 
-  // ---- device page rows ----
+  // ---- SETTINGS page rows ----
   //
   // Three shapes cover the whole page: a row of chips, a switch, and a camera
   // slot. They are components rather than repeated blocks because the page is
@@ -4137,7 +3938,7 @@ Panel {
     signal picked(string value)
 
     implicitHeight: chipContent.implicitHeight + Style.spacing.controlGap
-    hasCursor: root.cursorActive && root.focusSection === "device"
+    hasCursor: root.cursorActive && root.focusSection === "settings"
       && root.selectedIndex === rowIndex
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(chipRow)
     foreground: root.foreground
@@ -4197,7 +3998,7 @@ Panel {
         cursorIndex: -1
         onChanged: function(value) { chipRow.picked(value) }
         onHovered: function(index, isHovered) {
-          if (isHovered) root.setCursor("device", chipRow.rowIndex)
+          if (isHovered) root.setCursor("settings", chipRow.rowIndex)
         }
       }
 
@@ -4213,7 +4014,7 @@ Panel {
     }
 
     HoverHandler {
-      onHoveredChanged: if (hovered) root.setCursor("device", chipRow.rowIndex)
+      onHoveredChanged: if (hovered) root.setCursor("settings", chipRow.rowIndex)
     }
   }
 
@@ -4230,7 +4031,7 @@ Panel {
     signal switched(bool enabled)
 
     implicitHeight: switchContent.implicitHeight + Style.spacing.controlGap
-    hasCursor: root.cursorActive && root.focusSection === "device"
+    hasCursor: root.cursorActive && root.focusSection === "settings"
       && root.selectedIndex === rowIndex
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(switchRow)
     foreground: root.foreground
@@ -4304,7 +4105,7 @@ Panel {
     }
 
     HoverHandler {
-      onHoveredChanged: if (hovered) root.setCursor("device", switchRow.rowIndex)
+      onHoveredChanged: if (hovered) root.setCursor("settings", switchRow.rowIndex)
     }
   }
 
@@ -4323,7 +4124,7 @@ Panel {
     readonly property bool stored: entry !== null && entry !== undefined && entry.saved
 
     implicitHeight: slotInner.implicitHeight + Style.spacing.lg
-    hasCursor: root.cursorActive && root.focusSection === "device"
+    hasCursor: root.cursorActive && root.focusSection === "settings"
       && root.selectedIndex === rowIndex
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(slotRow)
     foreground: root.foreground
@@ -4394,12 +4195,12 @@ Panel {
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         onClicked: root.clearNativePreset(slotRow.slot)
-        onHovered: function(on) { if (on) root.setCursor("device", slotRow.rowIndex) }
+        onHovered: function(on) { if (on) root.setCursor("settings", slotRow.rowIndex) }
       }
     }
 
     HoverHandler {
-      onHoveredChanged: if (hovered) root.setCursor("device", slotRow.rowIndex)
+      onHoveredChanged: if (hovered) root.setCursor("settings", slotRow.rowIndex)
     }
   }
 
@@ -4413,7 +4214,8 @@ Panel {
     readonly property bool filled: Model.hasPreset(root.presets, slot)
 
     implicitHeight: presetInner.implicitHeight + Style.spacing.xl
-    hasCursor: root.cursorActive && root.focusSection === "presets" && root.selectedIndex === rowIndex
+    hasCursor: root.cursorActive && root.focusSection === "frame"
+      && root.selectedIndex === rowIndex
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(presetRow)
     foreground: root.foreground
     accent: root.accent
@@ -4427,7 +4229,7 @@ Panel {
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
-      onContainsMouseChanged: if (containsMouse) root.setCursor("presets", presetRow.rowIndex)
+      onContainsMouseChanged: if (containsMouse) root.setCursor("frame", presetRow.rowIndex)
       // Clicking a filled slot recalls it; clicking an empty one stores the
       // current framing, so the row is useful before it holds anything.
       onClicked: presetRow.filled ? root.loadPreset(presetRow.slot) : root.savePreset(presetRow.slot)
@@ -4494,7 +4296,7 @@ Panel {
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         onClicked: root.clearPreset(presetRow.slot)
-        onHovered: function(on) { if (on) root.setCursor("presets", presetRow.rowIndex) }
+        onHovered: function(on) { if (on) root.setCursor("frame", presetRow.rowIndex) }
       }
 
       Button {
@@ -4511,7 +4313,7 @@ Panel {
         anchors.rightMargin: clearButton.visible ? Style.spacing.xs : 0
         anchors.verticalCenter: parent.verticalCenter
         onClicked: root.savePreset(presetRow.slot)
-        onHovered: function(on) { if (on) root.setCursor("presets", presetRow.rowIndex) }
+        onHovered: function(on) { if (on) root.setCursor("frame", presetRow.rowIndex) }
       }
     }
   }

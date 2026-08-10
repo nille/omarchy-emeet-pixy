@@ -7,9 +7,9 @@ widget that looks and behaves like the first-party ones.
 
 ![The bar widget among the other bar icons](docs/bar.png)
 
-| Everything at once | Behind the cog | Lens closed |
-| --- | --- | --- |
-| ![The main panel: privacy switch, mode chips, live preview, jog pad, sliders, image controls, microphone and presets](docs/panel-main.png) | ![The advanced page: the rest of the image controls and named picture profiles](docs/panel-advanced.png) | ![Privacy mode: the preview collapsed to a closed-lens placeholder](docs/panel-privacy.png) |
+| FRAME | IMAGE | SETTINGS | Lens closed |
+| --- | --- | --- | --- |
+| ![The FRAME tab: privacy switch, pinned preview, mode chips, jog pad, pan/tilt/zoom sliders and the framing presets](docs/panel-frame.png) | ![The IMAGE tab: every control the driver reports, plus named picture profiles](docs/panel-image.png) | ![The SETTINGS tab: the camera's own firmware settings](docs/panel-settings.png) | ![Privacy mode: the preview collapsed to a closed-lens placeholder, the mode chips dimmed](docs/panel-privacy.png) |
 
 ## What it does
 
@@ -21,17 +21,17 @@ widget that looks and behaves like the first-party ones.
 - **Pan, tilt, and zoom.** A jog pad for aiming by feel, plus sliders showing the actual angle, read
   back from the hardware — so the panel is right even after another app moved the camera. Three presets
   save and recall a framing.
-- **A live preview, sized for framing.** A thumbnail above the jog pad, started when you open the panel
-  and stopped when you close it or the lens, or for good from the FRAMING header. Scroll past it and it
-  shrinks into the corner of the panel instead of leaving — the picture is the point of half these
-  settings, so it stays visible while you change them.
+- **A live preview, pinned above everything.** Full panel width, started when you open the panel and
+  stopped when you close it or the lens, or for good from the FRAMING header. It sits outside the
+  scrolling area, so no page can scroll it away — the picture is the point of half these settings, and
+  it stays visible while you change them.
 - **Microphone, too.** Mute, volume, and a live level meter for the camera's own mic — on a call it is
   usually the mic in use, so muting it belongs next to closing the lens rather than two panels away.
-- **Image controls that work during a call.** Brightness, contrast, saturation, sharpness, gamma and
-  white balance in the panel, with hue, gain, exposure, focus and the rest behind a cog, and named
-  profiles recalling every control at once. They go over UVC control ioctls rather than the capture
-  stream, so they work while a meeting client holds the camera.
-- **The camera's own settings**, on a page of their own: microphone noise cancelling, gesture control,
+- **Image controls that work during a call.** Every control the driver reports — brightness, contrast,
+  saturation, sharpness, gamma, white balance, hue, gain, exposure, focus and the rest — on the IMAGE
+  tab, with named profiles recalling all of them at once. They go over UVC control ioctls rather than
+  the capture stream, so they work while a meeting client holds the camera.
+- **The camera's own settings**, on the SETTINGS tab: microphone noise cancelling, gesture control,
   mirror and flip, what the autofocus aims at, and the idle shutter timeout. All of them live in the
   camera's firmware, so they persist across reboots and apply to every app — not just this one.
 - **Snapshots.** One button, or one keybinding, for a full-resolution still to `~/Pictures`.
@@ -108,7 +108,7 @@ the standard library.
 | `callTracking` | `false` | Switch to AI tracking for the duration of a call, then restore the previous mode. |
 | `callUnmute` | `false` | Unmute the camera's microphone when a call starts — only if it was muted. |
 
-The three `call*` settings have switches on the camera settings page too; see
+The three `call*` settings have switches on the SETTINGS tab too; see
 [When a call starts](#when-a-call-starts).
 
 Set them in the settings dialog, in `~/.config/omarchy/shell.json`, or from the CLI:
@@ -126,6 +126,21 @@ omarchy bar set nille.emeet-pixy callOpenLens true --json
 
 ## Using it
 
+### The four tabs
+
+The panel is a privacy switch, a tab bar and the preview — all three pinned — over one page at a time:
+
+| Tab | What is on it |
+| --- | --- |
+| **FRAME** | Standard/Tracking, the jog pad, pan, tilt, zoom, recenter, and the three framing presets |
+| **IMAGE** | Every image control the driver reports, plus named picture profiles |
+| **MIC** | Mute, volume, and the level meter for the camera's own microphone |
+| **SETTINGS** | The camera's own firmware settings, the focus pad, snapshots, and call automation |
+
+A tab whose hardware is missing is not drawn: no microphone on the PipeWire graph, no MIC tab. Each
+page is short enough to fit, which is the reason for the split — the preview can sit above them all
+without any page scrolling it out of view.
+
 ### Mouse
 
 | Action | Result |
@@ -133,22 +148,21 @@ omarchy bar set nille.emeet-pixy callOpenLens true --json
 | Left / right / middle-click the icon | Open the panel, toggle privacy, recenter |
 | Scroll the icon | Zoom |
 | Privacy switch | Close or open the lens |
+| Click a tab | Switch pages |
+| The preview | Recenter |
 | Standard / Tracking chips | Set the control mode (dimmed unless the camera is in use) |
-| Jog pad arrows | Pan and tilt |
-| Jog pad center, or the preview | Recenter |
+| Jog pad arrows, or its center | Pan and tilt, or recenter |
 | Switch on the FRAMING header | Turn the preview off or on |
-| Drag an image slider | Brightness, contrast, saturation, sharpness, gamma, white balance |
+| Save on a preset row | Store the current framing |
+| Click a filled preset row, or its `×` | Recall it, or clear it |
+| Drag an image slider | Any control on the IMAGE tab |
 | Auto white balance switch | Hand the temperature back to the camera |
-| Cog on the IMAGE header | Advanced controls and picture profiles |
 | `󰦛` on the IMAGE header | Reset every image control to the driver's default |
 | Click a profile row, or its `×` | Apply that picture, or delete it |
 | Mic button, or right-click the mic slider | Mute or unmute |
-| Save on a preset row | Store the current framing |
-| Click a filled preset row, or its `×` | Recall it, or clear it |
-| **Camera settings** row | The camera's own firmware settings, snapshots, and call automation |
-| Focus pad, on that page | Aim the autofocus spot |
+| Focus pad, on SETTINGS | Aim the autofocus spot |
 | Snapshot button | Save a full-resolution still to `~/Pictures` |
-| Scroll anywhere in the panel | Scroll the panel |
+| Scroll anywhere in the panel | Scroll the page |
 
 Scrolling always scrolls: the wheel deliberately does **not** adjust the slider under the cursor,
 because a gesture aimed at the presets used to land on the pan slider and swing the camera.
@@ -157,36 +171,37 @@ because a gesture aimed at the presets used to land on the pan slider and swing 
 
 | Key | Result |
 | --- | --- |
-| `j` / `k` | Move the cursor |
-| `h` / `l` | Adjust the slider under the cursor |
+| `[` / `]` | Previous / next tab |
+| `f` / `i` / `d` | Jump to FRAME, IMAGE, or SETTINGS |
+| `j` / `k` | Move the cursor, within the page |
+| `h` / `l` | Adjust the row under the cursor |
 | `space` | Activate the row under the cursor |
 | `p` | Privacy on/off |
 | `t` | Tracking ⇄ Standard (only while the camera is in use) |
 | `m` | Mute the microphone |
 | `v` | Turn the preview off/on |
 | `c` | Recenter |
-| `i` | Open or close the advanced image view |
-| `d` | Open or close the camera settings page |
-| `s` / `x` | Save the current framing into the preset under the cursor, or clear it |
-| `1` / `2` / `3` | Recall that preset |
+| `s` / `x` | Save into the preset or profile under the cursor, or clear it |
+| `1` / `2` / `3` | Recall that framing preset (FRAME only) |
 | `r` | Re-read the camera |
 | `Esc` | Close |
+
+`[` and `]` rather than `Tab`, which every panel in the Omarchy bar uses to move between *bar* panels
+and which this one leaves alone; and rather than `h`/`l`, which sweeps whatever the cursor is on and is
+most of what this panel is for. The hint line at the bottom of each page names the keys that page has.
 
 The jog pad is deliberately not a keyboard row: `hjkl` and the arrows are the same binding in every
 Omarchy panel, so a 2D pad has no keys of its own to claim. The pan and tilt sliders are the keyboard
 path instead.
 
-Inside the advanced view the keys shift to that page: `s` moves to the profile name field, `x` deletes
-the profile under the cursor, `Esc` backs out, and `1`–`3` do nothing, because profiles are named
-rather than numbered. On an image row `h`/`l` sweeps a slider, cycles a menu, or turns a switch off
-and on — `l` on, `h` off. On the name row `Enter` both focuses the field (suggesting a name if it is
-empty) and saves once there is one; while the field has focus it owns every key, and `Esc` hands it
-back.
+`Esc` closes from every tab. The pages are siblings rather than levels, so there is nothing to back
+out of first — which is what the two sub-pages this replaced each needed.
 
-The camera settings page works the same way: `h`/`l` cycles a set of chips or moves a switch, `Enter`
-toggles or cycles the row, `x` clears the camera preset slot under the cursor, and `d` or `Esc` backs
-out. `1`–`3` are inert there too — three numbered rows on that page are the *camera's* slots, so
-recalling a framing preset from it would act on a list that is not on screen.
+Two rows behave specially. On an image row `h`/`l` sweeps a slider, cycles a menu, or turns a switch
+off and on — `l` on, `h` off. On the profile name row `Enter` both focuses the field (suggesting a name
+if it is empty) and saves once there is one; while the field has focus it owns every key, and `Esc`
+hands it back. `1`–`3` are inert off FRAME: profiles are named rather than numbered, and the three
+numbered rows on SETTINGS are the *camera's* own slots.
 
 ### Hyprland bindings
 
@@ -254,9 +269,10 @@ no way to tell "gestures are off" from "nobody has looked yet".
 
 ## Image controls
 
-The **IMAGE** section holds the six controls worth reaching for: brightness, contrast, saturation,
-sharpness, gamma, and white balance behind its auto switch. The header shows what has been changed
-(`Brightness, contrast`, or `Default`), a reset, and a cog.
+The **IMAGE** tab holds every control the driver reports: brightness, contrast, saturation, sharpness,
+gamma and white balance behind its auto switch, then hue, gain, auto exposure and exposure time,
+autofocus and focus, power line frequency, and backlight compensation. The header shows what has been
+changed (`Brightness, contrast`, or `Default`) and a reset.
 
 **These work while another app has the camera** — the whole reason they are here rather than left to
 `v4l2-ctl`. Image settings travel over UVC control ioctls, unrelated to the capture stream, so unlike
@@ -268,16 +284,13 @@ the driver and the panel renders whatever comes back, so a firmware that drops a
 different range needs no change here. Raw values are shown as a percentage of their range, except where
 the number means something on its own — white balance in kelvin.
 
-### Behind the cog
+All of them on one list, rather than the six most-used with the rest behind a cog. That split existed
+only to keep the panel short, and the tab is short enough without it — a cog leading to "the other
+controls" was never something worth explaining.
 
-Hue, gain, auto exposure and exposure time, autofocus and focus, power line frequency, and backlight
-compensation: either set-once, or things you touch only when something specific is wrong. The cog opens
-a page rather than a second popup, so the keyboard keeps one cursor over one visible list; `i` opens
-and closes it, `Esc` backs out.
-
-Picture profiles live there too — a name storing every control at once, put back with one click. They
-are deliberately separate from the three framing presets: recalling a framing preset must not quietly
-change how the picture looks.
+Picture profiles are at the bottom of the tab — a name storing every control at once, put back with one
+click. They are deliberately separate from the three framing presets: recalling a framing preset must
+not quietly change how the picture looks.
 
 ### Auto switches hold their manual partner
 
@@ -298,8 +311,8 @@ the room rather than the picture.
 
 ## Camera settings
 
-The **Camera settings** row at the bottom of the panel — or `d` — opens a second page holding the
-things that live in the camera's own firmware rather than in the driver or in this widget:
+The **SETTINGS** tab — or `d` — holds the things that live in the camera's own firmware rather than in
+the driver or in this widget:
 
 | Setting | What it is |
 | --- | --- |
@@ -312,7 +325,7 @@ things that live in the camera's own firmware rather than in the driver or in th
 
 Because these are firmware settings they **persist across reboots and apply to every app** — the mirror
 you set here is mirrored in Zoom, and it stays that way with this widget uninstalled. That is what makes
-them worth carrying, and also why they are on a page of their own instead of mixed in with the controls
+them worth carrying, and also why they are on a tab of their own instead of mixed in with the controls
 that only affect this session.
 
 The page is read on demand rather than polled: reading it is ten HID queries sharing one descriptor and
@@ -383,14 +396,18 @@ Releasing quickly matters more than resuming quickly, so the two are polled diff
 holders` call every 1.5 s while the preview holds the camera, and a resume riding the ordinary
 `refreshIntervalSec`.
 
-### Where the preview goes when you scroll
+### Why the picture is pinned
 
-Half these controls are judged by looking at the picture — mirror, focus, brightness, every image slider
-— and the panel is taller than the box that holds it, so the picture used to scroll off the top exactly
-when it was needed. Instead it now shrinks as its frame leaves the top edge and docks to the top-right
-corner of the viewport, floating over the rows, then slides back into place on the way up. There is still
-only one stream and one preview: it is the same picture, moved, not a second copy competing with the
-first for the device. Clicking it recenters the camera, docked or not.
+Half these controls are judged by looking at the picture — mirror, focus, brightness, every image
+slider — and the panel used to be one list taller than the box holding it, so the picture scrolled off
+the top exactly when it was needed. The tabs are what fixed that: with the controls split across four
+pages that each fit, the preview lives outside the scrolling area entirely and no page can move it.
+
+The first attempt was a floating mini-preview that shrank into the corner as its frame left the top
+edge. It worked, but a picture that follows you around the panel is a picture you are always slightly
+aware of, and it was small precisely when you were using it. There is one stream and one `VideoOutput`
+either way — only one process can hold the capture device, so a second copy would fail against the
+first.
 
 ### Turning the preview off
 
@@ -531,9 +548,9 @@ matched on file contents rather than process name, so unrelated Python programs 
 - `docs/PROTOCOL.md` — the wire protocol, what was verified against hardware, and why several of the
   camera's features are unused
 - `tests/test_pixy.py` — 396 unit tests over the helper
-- `tests/qml/` — 231 QML tests: input routing, cursor arithmetic, and the `Model.js` functions that
-  need a JS engine rather than Python — including the camera-settings page's row order, the call
-  automation's restore round trip, and where the preview is drawn as it docks
+- `tests/qml/` — 260 QML tests: input routing, cursor arithmetic, and the `Model.js` functions that
+  need a JS engine rather than Python — including each tab's row order, which tabs a given camera
+  earns, and the call automation's restore round trip
 - `tests/harness/shell.qml` — standalone window for developing the panel without a running Omarchy
   shell, launched by `tests/harness/run`
 - `preview.png` — composite of the screenshots above, at the repository root because that is where
