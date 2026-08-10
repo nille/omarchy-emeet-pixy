@@ -22,7 +22,7 @@ widget that looks and behaves like the first-party ones.
   back from the hardware — so the panel is right even after another app moved the camera. Three presets
   save and recall a framing.
 - **A live preview, pinned above everything.** Full panel width, started when you open the panel and
-  stopped when you close it or the lens, or for good from the FRAMING header. It sits outside the
+  stopped when you close it or the lens, or for good from the switch on FRAME. It sits outside the
   scrolling area, so no page can scroll it away — the picture is the point of half these settings, and
   it stays visible while you change them.
 - **Microphone, too.** Mute, volume, and a live level meter for the camera's own mic — on a call it is
@@ -103,7 +103,7 @@ the standard library.
 | `refreshIntervalSec` | `10` | How often to re-read camera state while the panel is open. |
 | `ptzStep` | `5` | How far one jog-pad press or slider step moves the camera, in degrees. |
 | `hideWhenAbsent` | `false` | Remove the bar icon when no camera is found, instead of showing a dimmed one. |
-| `preview` | `true` | Show a live video preview in the panel. The switch on the panel's FRAMING header writes this same setting. See [The preview and other apps](#the-preview-and-other-apps). |
+| `preview` | `true` | Show a live video preview in the panel. The switch on the FRAME tab writes this same setting. See [The preview and other apps](#the-preview-and-other-apps). |
 | `callOpenLens` | `false` | Open the lens when another app starts using the camera, and close it again after. |
 | `callTracking` | `false` | Switch to AI tracking for the duration of a call, then restore the previous mode. |
 | `callUnmute` | `false` | Unmute the camera's microphone when a call starts — only if it was muted. |
@@ -137,9 +137,10 @@ The panel is a privacy switch, a tab bar and the preview — all three pinned �
 | **MIC** | Mute, volume, and the level meter for the camera's own microphone |
 | **SETTINGS** | The camera's own firmware settings, the focus pad, snapshots, and call automation |
 
-A tab whose hardware is missing is not drawn: no microphone on the PipeWire graph, no MIC tab. Each
-page is short enough to fit, which is the reason for the split — the preview can sit above them all
-without any page scrolling it out of view.
+A tab whose hardware is missing is not drawn: no microphone on the PipeWire graph, no MIC tab. FRAME
+and MIC fit the panel outright; IMAGE and SETTINGS are longer than any sensible panel height and still
+scroll — but the preview is pinned outside the scrolling area, so scrolling them no longer takes the
+picture with it. That is the reason for the split.
 
 ### Mouse
 
@@ -152,7 +153,7 @@ without any page scrolling it out of view.
 | The preview | Recenter |
 | Standard / Tracking chips | Set the control mode (dimmed unless the camera is in use) |
 | Jog pad arrows, or its center | Pan and tilt, or recenter |
-| Switch on the FRAMING header | Turn the preview off or on |
+| Switch on the FRAMING header, on FRAME | Turn the preview off or on |
 | Save on a preset row | Store the current framing |
 | Click a filled preset row, or its `×` | Recall it, or clear it |
 | Drag an image slider | Any control on the IMAGE tab |
@@ -175,13 +176,14 @@ because a gesture aimed at the presets used to land on the pan slider and swing 
 | `f` / `i` / `d` | Jump to FRAME, IMAGE, or SETTINGS |
 | `j` / `k` | Move the cursor, within the page |
 | `h` / `l` | Adjust the row under the cursor |
-| `space` | Activate the row under the cursor |
+| `space` / `Enter` | Activate the row under the cursor |
 | `p` | Privacy on/off |
 | `t` | Tracking ⇄ Standard (only while the camera is in use) |
 | `m` | Mute the microphone |
 | `v` | Turn the preview off/on |
 | `c` | Recenter |
-| `s` / `x` | Save into the preset or profile under the cursor, or clear it |
+| `s` | Store the framing preset under the cursor, or start naming a picture profile |
+| `x` | Clear the preset, profile, or camera slot under the cursor |
 | `1` / `2` / `3` | Recall that framing preset (FRAME only) |
 | `r` | Re-read the camera |
 | `Esc` | Close |
@@ -284,7 +286,7 @@ the driver and the panel renders whatever comes back, so a firmware that drops a
 different range needs no change here. Raw values are shown as a percentage of their range, except where
 the number means something on its own — white balance in kelvin.
 
-All of them on one list, rather than the six most-used with the rest behind a cog. That split existed
+All fifteen on one list, rather than the everyday seven with the rest behind a cog. That split existed
 only to keep the panel short, and the tab is short enough without it — a cog leading to "the other
 controls" was never something worth explaining.
 
@@ -401,7 +403,7 @@ holders` call every 1.5 s while the preview holds the camera, and a resume ridin
 Half these controls are judged by looking at the picture — mirror, focus, brightness, every image
 slider — and the panel used to be one list taller than the box holding it, so the picture scrolled off
 the top exactly when it was needed. The tabs are what fixed that: with the controls split across four
-pages that each fit, the preview lives outside the scrolling area entirely and no page can move it.
+pages, the preview lives outside the scrolling area entirely and nothing below it can move it.
 
 The first attempt was a floating mini-preview that shrank into the corner as its frame left the top
 edge. It worked, but a picture that follows you around the panel is a picture you are always slightly
@@ -411,7 +413,8 @@ first.
 
 ### Turning the preview off
 
-Flip the switch next to the eye on the **FRAMING** header and the frame collapses; every control keeps
+Flip the switch next to the eye on the **FRAMING** header, on the FRAME tab, and the frame collapses;
+every control keeps
 working. Or press `v`, or bind `previewOff` to a key, or set it from the CLI — all of them write the
 same persistent `preview` setting:
 
@@ -487,7 +490,7 @@ scripts/pixy image --set whiteBalance=3200                            # ...races
 scripts/pixy image --reset --set brightness=160                       # composes
 ```
 
-`--curated` limits the reply to the controls the panel's main section shows; `--force` applies the
+`--curated` limits the reply to the seven everyday controls; `--force` applies the
 assignments that parsed instead of refusing the whole call, reporting the rest as `warnings`. Every
 reply carries the full readback, so one round trip both writes and refreshes — necessary rather than
 convenient, since the `inactive` flags can only be known *after* a write.
@@ -548,7 +551,7 @@ matched on file contents rather than process name, so unrelated Python programs 
 - `docs/PROTOCOL.md` — the wire protocol, what was verified against hardware, and why several of the
   camera's features are unused
 - `tests/test_pixy.py` — 396 unit tests over the helper
-- `tests/qml/` — 260 QML tests: input routing, cursor arithmetic, and the `Model.js` functions that
+- `tests/qml/` — 263 QML tests: input routing, cursor arithmetic, and the `Model.js` functions that
   need a JS engine rather than Python — including each tab's row order, which tabs a given camera
   earns, and the call automation's restore round trip
 - `tests/harness/shell.qml` — standalone window for developing the panel without a running Omarchy

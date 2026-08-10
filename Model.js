@@ -406,9 +406,10 @@ function callActionLabel(plan) {
 // Both reports are the same underlying fact — the panel had grown to roughly two
 // and a half screens, so anything below the fold was reached by scrolling the
 // picture away. The floating dock treated the symptom by making the picture escape
-// the scroll. This treats the cause: the body is split into pages that each fit,
-// the preview is pinned above them where nothing can scroll it, and there is no
-// scrolling to survive in the first place.
+// the scroll. This treats the cause: the body is split into pages, and the preview
+// is pinned above them where no scroll reaches it. Two of the four still scroll —
+// IMAGE and SETTINGS are longer than any panel height worth setting — but scrolling
+// them no longer takes the picture with it.
 //
 // Consequences worth stating, because they are what make it cheap:
 //
@@ -421,8 +422,8 @@ function callActionLabel(plan) {
 //   it is what keeps j/k honest: one list, no jumping between groups.
 //
 // FRAME is first because it is what the widget is for. SETTINGS is last because it
-// is the page you visit once. MIC sits between IMAGE and SAVED rather than at the
-// end, so the two "adjust a level" pages are neighbours.
+// is the page you visit once. MIC sits after IMAGE so the two pages that are nothing
+// but levels are neighbours.
 //
 // `value` rather than `key`, because this list is handed straight to
 // `Ui/ButtonGroup` as its `options` and ButtonGroup reads `value` — a chip whose

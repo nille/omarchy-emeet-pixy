@@ -198,20 +198,10 @@ Panel {
 
   // ---------------------------------------------------------------- pages
   //
-  // *(reported)* "not sure i love the floating sticky thing", of the mini-preview
-  // that used to shrink into the corner of the viewport as you scrolled past it —
-  // itself an answer to *(reported)* "there is no way to see the preview window
-  // when adjusting most of the settings".
-  //
-  // Both reports come from one fact: the panel had grown to about two and a half
-  // screens, so anything below the fold was reached by scrolling the picture away —
-  // and the picture is what half these controls are adjusted against. The dock made
-  // the picture escape the scroll. This removes the scroll: the body is four pages
-  // that each fit, and the preview is pinned above them where nothing moves it.
-  //
-  // Model.PAGES is the list and Model.visiblePages decides which of them this
-  // camera has earned. See the note there for the ordering and for why a page with
-  // nothing on it is worse than a missing tab.
+  // The body is a tab per page, with the preview pinned above all of them. Model.PAGES
+  // is the list, Model.visiblePages decides which of them this camera has earned, and
+  // the note there has the two reports that led here and the reasoning behind the
+  // ordering. What is here is only the current page and the machinery for changing it.
   property string page: "frame"
 
   readonly property var pages: Model.visiblePages({
@@ -1790,12 +1780,10 @@ Panel {
     // too short and the pages permanently scrolling by that much.
     //
     // The cap is taller than the 560-640 the first-party panels use, because the
-    // pinned block is most of a picture: the preview alone is around 180px of the
-    // 270 above the pages. Sized so FRAME fits under it exactly — that is the page
+    // pinned block is most of a picture: the preview alone is around 180 of the 270
+    // above the pages. Measured so FRAME fits under it exactly — that is the page
     // aiming happens on, and a jog pad you have to scroll to reach is the whole
-    // problem this restructure was about. IMAGE and SETTINGS are longer than any
-    // cap worth setting and still scroll; what changed is that scrolling them no
-    // longer takes the picture with it.
+    // problem this restructure was about.
     contentHeight: panel.fittedContentHeight(
       pinnedColumn.implicitHeight + Style.spacing.panelGap + panelColumn.implicitHeight,
       Style.space(920))
@@ -1870,21 +1858,14 @@ Panel {
 
       // ---------------------------------------------------------------- pinned
       //
-      // Everything above the pages, and outside the ScrollView on purpose.
+      // Everything above the pages: the hero, the tab bar, and the picture.
       //
-      // *(reported)* "since it is longer than the containing box there is no way to
-      // see the preview window when adjusting most of the settings", and then, of the
-      // floating mini-preview that first answered it, "not sure i love the floating
-      // sticky thing". The picture is what you judge mirroring, focus, brightness and
-      // every image slider by, and it was a row near the top of a scrolling column
-      // two pages taller than its box.
+      // A *sibling* of the ScrollView rather than its first row, which is the whole
+      // point — see the pages note for what that fixed. The picture is what you judge
+      // mirroring, focus and every image slider by, so it has to be somewhere the
+      // scroll never was rather than somewhere it animates out to.
       //
-      // Sibling of the ScrollView rather than its first row, which is the whole fix:
-      // the pages below can scroll as much as they like and none of it reaches the
-      // picture. The floating version got the picture out of the scroll by animating
-      // it out; this gives it somewhere the scroll never was.
-      //
-      // The hero comes along because privacy belongs next to the picture — the switch
+      // The hero comes along because privacy belongs beside the picture — the switch
       // and the thing it closes should not be a scroll apart — and because it is the
       // panel's title.
       Column {
@@ -1942,14 +1923,9 @@ Panel {
         }
         // ---------- Pages ----------
         //
-        // A tab bar rather than the two entry rows and two Back rows this replaces.
-        // Four pages that each fit beat one page that does not: the sub-pages were
-        // already body-replacing views reached by their own keys, so making them
-        // siblings of FRAME costs nothing and buys the same treatment for the rest.
-        //
-        // Not in the j/k cursor walk, the same call ButtonGroup gets everywhere else
-        // in this panel: `[` and `]` move between pages, and a tab bar that also
-        // caught j/k would put a row of chips between the cursor and every control.
+        // Not in the j/k cursor walk, the same call every other ButtonGroup in this
+        // panel gets: `[` and `]` move between pages, and a tab bar that also caught
+        // j/k would put a row of chips between the cursor and every control.
         CursorSurface {
           id: pageRow
           width: parent.width
@@ -1967,13 +1943,11 @@ Panel {
             anchors.rightMargin: Style.space(6)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.spacing.sm
+            // Handed straight over: PAGES carries the label and the value under
+            // exactly the names ButtonGroup reads, so there is no mapping step to get
+            // wrong — see the note on PAGES for what happened when there was.
             options: root.pages
             value: root.page
-            // The label is what the chip says; `value` is what it means. PAGES
-            // carries both under exactly the names ButtonGroup reads, so there is no
-            // mapping step here — see the note on PAGES for what happened when the
-            // field was named `key` instead, and why the fix was to rename the field
-            // rather than to map it on the way in.
             foreground: root.foreground
             accent: root.accent
             background: root.bar ? root.bar.background : Color.background
@@ -1992,11 +1966,8 @@ Panel {
         // fail with EBUSY against the first — the panel's own preview competing with
         // itself, which is the failure this widget spends the most care avoiding.
         // Keeping it in one fixed place is what makes that easy to hold: there is
-        // nowhere for it to move to.
-        //
-        // 16:9 at a fixed width, and no longer any arithmetic — the docked version
-        // computed a size and a corner from the scroll position, and all of it is
-        // gone with the scroll it tracked.
+        // nowhere for it to move to, and 16:9 at a fixed width has no arithmetic to
+        // get wrong.
         //
         // Turned off entirely by the setting rather than left as an empty frame:
         // someone who disabled the preview does not want a permanent reminder of it
@@ -2015,10 +1986,8 @@ Panel {
             anchors.fill: parent
             radius: Style.cornerRadius
             color: Qt.darker(root.bar ? root.bar.background : Color.background, 1.3)
-            // The ordinary faint outline, at one width in one colour. The floating
-            // version needed an accent edge and a shadow to separate itself from the
-            // rows it covered; this one covers nothing — it has a place of its own
-            // above the pages, and the layout does the separating.
+            // One width, one colour: it covers nothing and has a place of its own, so
+            // the layout does the separating an accent edge and a shadow used to.
             border.width: Style.normalBorderWidth
             border.color: root.faint
 
@@ -2976,10 +2945,6 @@ Panel {
           // kind of thing from everything else here — settings stored *in* the camera,
           // which follow it to another machine, rather than V4L2 controls or shell
           // preferences that belong to this host.
-          //
-          // It used to be reached from an entry row on the main page and left by a
-          // Back row at the top of this one. Both are gone: it is a tab, so the way in
-          // and the way out are the same two keys as every other page.
           //
           // Row order is the drawn order and the cursor order both, and every row
           // takes its index from the settingsXRow properties rather than a literal —
