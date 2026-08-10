@@ -3468,9 +3468,14 @@ Panel {
           width: previewLayer.width,
           height: previewLayer.height,
           inset: Style.space(10),
-          // A third of the panel: small enough that the labels beside it stay
-          // readable, large enough to see a mirror flip or a focus change.
-          miniWidth: Math.round(previewLayer.width / 3),
+          // Model owns the fraction and the reasoning for it — see
+          // PREVIEW_DOCK_FRACTION, and *(reported)* "the preview window is too small".
+          miniWidth: Math.round(previewLayer.width * Model.PREVIEW_DOCK_FRACTION),
+          // Below this the placeholder keeps its glyph and drops its sentence. Stated
+          // in the theme's own units so a large font scale reaches the threshold at
+          // the same apparent size a small one does — the question is whether a line
+          // of text fits, and that is a question about the font.
+          compactBelow: Style.space(200),
           corner: "top"
         })
 
