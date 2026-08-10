@@ -46,7 +46,7 @@ Item {
 
   function keys(pages) {
     var out = []
-    for (var i = 0; i < pages.length; i++) out.push(pages[i].key)
+    for (var i = 0; i < pages.length; i++) out.push(pages[i].value)
     return out
   }
 
@@ -89,9 +89,42 @@ Item {
       // either way is a tab you cannot read, and PAGES is the only place both live.
       for (var i = 0; i < Model.PAGES.length; i++) {
         var page = Model.PAGES[i]
-        verify(page.key !== "", "page " + i + " has no key")
-        verify(page.label !== "", page.key + " has no label")
-        verify(page.tooltip !== "", page.key + " has no tooltip")
+        verify(page.value !== "", "page " + i + " has no value")
+        verify(page.label !== "", page.value + " has no label")
+        verify(page.tooltip !== "", page.value + " has no tooltip")
+      }
+    }
+
+    function test_the_page_field_is_the_one_buttongroup_reads() {
+      // *(reported)* "the buttons for settings, mic etc do not work". PAGES is handed
+      // straight to Ui/ButtonGroup as its `options`, and ButtonGroup reads `value` off
+      // each option — so while the field was named `key`, every chip's value was
+      // String(undefined). Clicking any tab called showPage("undefined"), which
+      // resolvePage answered with the first page: all four tabs went to FRAME, and no
+      // tab ever painted as current because none of them matched.
+      //
+      // Nothing in the arithmetic above catches it — the helpers agreed with the field
+      // name they were written against, and every one of them still passed. It is only
+      // wrong at the boundary with a component in another repository, so the assertion
+      // has to name that contract outright.
+      for (var i = 0; i < Model.PAGES.length; i++) {
+        var page = Model.PAGES[i]
+        verify(page.value !== undefined, "page " + i + " has no `value` for ButtonGroup")
+        compare(typeof page.value, "string", "page " + i + " value is not a string")
+        compare(page.key, undefined,
+                "page " + i + " still carries `key`; ButtonGroup reads `value`")
+      }
+    }
+
+    function test_a_page_resolves_from_its_own_option_object() {
+      // The round trip a tab click makes: ButtonGroup hands back the option's `value`,
+      // the panel passes it to showPage, and resolvePage has to recognise it. Every
+      // page, so a fifth one cannot be added with the wrong field name.
+      var pages = Model.visiblePages(caps({}))
+      for (var i = 0; i < pages.length; i++) {
+        var clicked = pages[i].value
+        compare(Model.resolvePage(clicked, pages), clicked)
+        compare(Model.pageIndex(clicked, pages), i)
       }
     }
 
@@ -191,9 +224,9 @@ Item {
       // panels, and it is not h/l, which sweeps whatever slider the cursor is on.
       var pages = Model.visiblePages(caps({}))
       for (var i = 0; i < pages.length; i++) {
-        var hint = Model.pageHints(pages[i].key, caps({}))
-        compare(hint.indexOf("[/] page"), 0, pages[i].key + ": " + hint)
-        verify(hint.indexOf("tab ") < 0, pages[i].key + " claims Tab: " + hint)
+        var hint = Model.pageHints(pages[i].value, caps({}))
+        compare(hint.indexOf("[/] page"), 0, pages[i].value + ": " + hint)
+        verify(hint.indexOf("tab ") < 0, pages[i].value + " claims Tab: " + hint)
       }
     }
 
@@ -203,10 +236,10 @@ Item {
       // changed about them.
       var pages = Model.visiblePages(caps({}))
       for (var i = 0; i < pages.length; i++) {
-        var hint = Model.pageHints(pages[i].key, caps({}))
-        verify(hint.indexOf("r refresh") >= 0, pages[i].key + ": " + hint)
-        verify(hint.indexOf("esc close") >= 0, pages[i].key + ": " + hint)
-        verify(hint.indexOf("esc back") < 0, pages[i].key + " still says back")
+        var hint = Model.pageHints(pages[i].value, caps({}))
+        verify(hint.indexOf("r refresh") >= 0, pages[i].value + ": " + hint)
+        verify(hint.indexOf("esc close") >= 0, pages[i].value + ": " + hint)
+        verify(hint.indexOf("esc back") < 0, pages[i].value + " still says back")
       }
     }
 

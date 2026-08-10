@@ -423,11 +423,19 @@ function callActionLabel(plan) {
 // FRAME is first because it is what the widget is for. SETTINGS is last because it
 // is the page you visit once. MIC sits between IMAGE and SAVED rather than at the
 // end, so the two "adjust a level" pages are neighbours.
+//
+// `value` rather than `key`, because this list is handed straight to
+// `Ui/ButtonGroup` as its `options` and ButtonGroup reads `value` — a chip whose
+// option object has no `value` gets `String(undefined)`, so every tab reports
+// `"undefined"` on click and `resolvePage` falls the whole bar back to FRAME. Which
+// is exactly what happened: *(reported)* "the buttons for settings, mic etc do not
+// work". Naming the field what the consumer reads is the fix that cannot come back —
+// there is no mapping step left to forget.
 var PAGES = [
-  { key: "frame", label: "FRAME", tooltip: "Aim the camera, mode, presets" },
-  { key: "image", label: "IMAGE", tooltip: "Brightness, contrast, and the rest" },
-  { key: "mic", label: "MIC", tooltip: "The camera's microphone" },
-  { key: "settings", label: "SETTINGS", tooltip: "The camera's own firmware settings" }
+  { value: "frame", label: "FRAME", tooltip: "Aim the camera, mode, presets" },
+  { value: "image", label: "IMAGE", tooltip: "Brightness, contrast, and the rest" },
+  { value: "mic", label: "MIC", tooltip: "The camera's microphone" },
+  { value: "settings", label: "SETTINGS", tooltip: "The camera's own firmware settings" }
 ]
 
 // Which pages to draw, given what this camera turned out to have.
@@ -444,11 +452,11 @@ function visiblePages(caps) {
   var out = []
   for (var i = 0; i < PAGES.length; i++) {
     var page = PAGES[i]
-    if (page.key === "image" && !c.hasImage) continue
-    if (page.key === "mic" && !c.hasMic) continue
+    if (page.value === "image" && !c.hasImage) continue
+    if (page.value === "mic" && !c.hasMic) continue
     // Every settings row is a vendor HID write, so without the HID interface the
     // page is a list of controls that cannot do anything.
-    if (page.key === "settings" && !c.hasVendor) continue
+    if (page.value === "settings" && !c.hasVendor) continue
     out.push(page)
   }
   return out
@@ -465,8 +473,8 @@ function resolvePage(wanted, pages) {
   var list = (pages && pages.length) ? pages : []
   if (!list.length) return ""
   for (var i = 0; i < list.length; i++)
-    if (list[i].key === wanted) return wanted
-  return list[0].key
+    if (list[i].value === wanted) return wanted
+  return list[0].value
 }
 
 // Step to the next or previous page, stopping at the ends.
@@ -483,16 +491,16 @@ function stepPage(current, pages, direction) {
   if (!list.length) return ""
   var at = 0
   for (var i = 0; i < list.length; i++)
-    if (list[i].key === current) at = i
+    if (list[i].value === current) at = i
   var next = at + (direction > 0 ? 1 : -1)
-  if (next < 0 || next >= list.length) return list[at].key
-  return list[next].key
+  if (next < 0 || next >= list.length) return list[at].value
+  return list[next].value
 }
 
 function pageIndex(key, pages) {
   var list = (pages && pages.length) ? pages : []
   for (var i = 0; i < list.length; i++)
-    if (list[i].key === key) return i
+    if (list[i].value === key) return i
   return -1
 }
 
