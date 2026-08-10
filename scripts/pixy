@@ -219,10 +219,12 @@ ARCSEC_PER_DEGREE = 3600
 # the slider rather than guessing — see `IMAGE_CONTROLS` consumers. On an auto
 # control, `manual` is the value that hands control back, defaulting to 0.
 #
-# `curated` marks the controls the panel shows without being asked. The split is
-# editorial, not technical: brightness and contrast are what someone reaches for
-# when the picture looks wrong, while gain and hue are things you set once a year
-# if ever. Everything not curated is still fully available, just behind the cog.
+# `curated` marks the everyday controls, for callers that want the short list —
+# `image --curated` reports only these. Editorial, not technical: brightness and
+# contrast are what someone reaches for when the picture looks wrong, while gain and
+# hue are set once a year if ever. The panel shows all of them and ignores the flag;
+# it used to show the curated five and hide the rest behind a cog, which was about
+# panel length rather than about the controls.
 IMAGE_CONTROLS = (
     {"key": "brightness", "cid": 0x00980900, "label": "Brightness", "curated": True},
     {"key": "contrast", "cid": 0x00980901, "label": "Contrast", "curated": True},
@@ -2784,7 +2786,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_image.add_argument("--reset", action="store_true",
                          help="restore every image control to the driver's default")
     p_image.add_argument("--curated", action="store_true",
-                         help="report only the controls the panel shows up front")
+                         help="report only the everyday controls")
     p_image.add_argument("--force", action="store_true",
                          help="apply the valid assignments even if others are bad")
     p_image.set_defaults(fn=cmd_image)

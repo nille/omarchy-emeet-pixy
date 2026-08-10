@@ -663,9 +663,7 @@ Panel {
   //   "frame"    - mode chips (0), preview switch (1), pan (2), tilt (3), zoom (4),
   //                recenter (5), then one row per preset slot
   //   "image"    - one row per control, then one per saved profile, then the save
-  //                field. Curated and advanced controls are one list now: the page
-  //                fits either way, and the split existed to keep the main page
-  //                short.
+  //                field
   //   "mic"      - the volume slider (0)
   //   "settings" - the firmware rows, in drawn order
   //
@@ -717,14 +715,8 @@ Panel {
 
   // ---- the IMAGE page's rows ----
   //
-  // One list of controls rather than the curated/advanced split the main page used
-  // to need. That split was about panel length: five sliders on the main page and
-  // the rest behind a cog, because all fourteen made the panel unscrollably long.
-  // The page fits all of them, so the reason is gone — and a cog leading to "the
-  // other controls" was never something to explain to anyone.
-  //
-  // The helper's order is kept, which is editorial: an auto switch sits below the
-  // slider it gates.
+  // One row per control the driver answered for, in the helper's order — which is
+  // editorial: an auto switch sits below the slider it gates.
   readonly property int imageControlRow: 0
   readonly property int imageProfileRow: imageControlRow + imageControls.length
   readonly property int imageSaveRow: imageProfileRow + imageProfiles.length
@@ -2596,12 +2588,11 @@ Panel {
           // while another app holds the capture stream. Fixing a washed-out
           // picture mid-call is a thing you do *in* the call.
           //
-          // One list of every control the driver answered for. There used to be a
-          // curated five here and the rest behind a cog, split by how often you reach
-          // for a control rather than by difficulty — and the reason for that split
-          // was panel length, not the controls. A page holds all of them, so the cog
-          // and the "advanced" half are gone. Nobody has to be told which controls
-          // are the ordinary ones.
+          // Every control the driver answered for, in one list. Seven of them used to
+          // be here and the other eight behind a cog, because all fifteen made the old
+          // main page unscrollably long — the split was about length, never about the
+          // controls. A page that fits needs no cog, and nobody has to be told which
+          // controls are the ordinary ones.
           //
           // Hidden rather than disabled when there are no controls, on the same
           // reasoning as the mic section: a greyed-out slider stack on a camera
@@ -3562,9 +3553,9 @@ Panel {
   }
 
   // One image control: glyph, label, value, and whichever widget its type calls
-  // for. Every image row on both pages is one of these — the curated sliders, the
-  // auto switches, and the menus behind the cog — because the difference between
-  // them is the control's type, which the helper reports, not the page they sit on.
+  // for. Every row on the IMAGE page is one of these, whatever the control does,
+  // because what differs between them is the control's *type* — which the helper
+  // reports — and not anything this side has to know about.
   //
   // Three widgets, chosen by type:
   //   boolean → ToggleSwitch, because auto/manual is a switch

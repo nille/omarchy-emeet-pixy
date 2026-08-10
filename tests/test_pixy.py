@@ -1318,9 +1318,10 @@ class ImageTableTests(unittest.TestCase):
         for key in pixy.RESET_EXCLUDE:
             self.assertIn(key, pixy.IMAGE_BY_KEY)
 
-    def test_the_curated_set_is_what_the_panel_shows(self):
-        # Pinned deliberately: this is the front page of the section, and adding
-        # to it is a design decision rather than a detail.
+    def test_the_curated_set_is_the_everyday_controls(self):
+        # `image --curated` is the only reader — the panel shows all of them — so
+        # this list is a claim about which controls people reach for, and adding to
+        # it is a design decision rather than a detail.
         self.assertEqual(
             [c["key"] for c in pixy.IMAGE_CONTROLS if c.get("curated")],
             ["brightness", "contrast", "saturation", "sharpness", "gamma",
@@ -1338,7 +1339,7 @@ class ReadImageTests(unittest.TestCase):
         self.assertEqual([c["key"] for c in controls],
                          [c["key"] for c in pixy.IMAGE_CONTROLS])
 
-    def test_curated_only_reports_the_front_page(self):
+    def test_curated_only_narrows_the_list(self):
         controls = pixy.read_image(image_camera(), curated_only=True)
         self.assertEqual([c["key"] for c in controls],
                          ["brightness", "contrast", "saturation", "sharpness",
