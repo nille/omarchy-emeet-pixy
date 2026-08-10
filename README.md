@@ -22,15 +22,24 @@ widget that looks and behaves like the first-party ones.
   back from the hardware — so the panel is right even after another app moved the camera. Three presets
   save and recall a framing.
 - **A live preview, sized for framing.** A thumbnail above the jog pad, started when you open the panel
-  and stopped when you close it or the lens, or for good from the FRAMING header.
+  and stopped when you close it or the lens, or for good from the FRAMING header. Scroll past it and it
+  shrinks into the corner of the panel instead of leaving — the picture is the point of half these
+  settings, so it stays visible while you change them.
 - **Microphone, too.** Mute, volume, and a live level meter for the camera's own mic — on a call it is
   usually the mic in use, so muting it belongs next to closing the lens rather than two panels away.
 - **Image controls that work during a call.** Brightness, contrast, saturation, sharpness, gamma and
   white balance in the panel, with hue, gain, exposure, focus and the rest behind a cog, and named
   profiles recalling every control at once. They go over UVC control ioctls rather than the capture
   stream, so they work while a meeting client holds the camera.
+- **The camera's own settings**, on a page of their own: microphone noise cancelling, gesture control,
+  mirror and flip, what the autofocus aims at, and the idle shutter timeout. All of them live in the
+  camera's firmware, so they persist across reboots and apply to every app — not just this one.
+- **Snapshots.** One button, or one keybinding, for a full-resolution still to `~/Pictures`.
+- **Automation for calls.** Optionally open the lens, switch on tracking and unmute when any app starts
+  using the camera, and put each one back afterwards — only the ones it actually changed.
 - **Honest about what it cannot know.** The camera can neither report nor change Standard vs Tracking
   while nothing is using it, so the chips dim and say why instead of taking a press that goes nowhere.
+  Everywhere else, a setting the camera would not report reads "not reported" rather than "off".
 - **Keyboard driven**, and **themed** — colors, font, rounding and borders all come from the active
   Omarchy theme, so `omarchy theme set` restyles it live.
 
@@ -95,6 +104,12 @@ the standard library.
 | `ptzStep` | `5` | How far one jog-pad press or slider step moves the camera, in degrees. |
 | `hideWhenAbsent` | `false` | Remove the bar icon when no camera is found, instead of showing a dimmed one. |
 | `preview` | `true` | Show a live video preview in the panel. The switch on the panel's FRAMING header writes this same setting. See [The preview and other apps](#the-preview-and-other-apps). |
+| `callOpenLens` | `false` | Open the lens when another app starts using the camera, and close it again after. |
+| `callTracking` | `false` | Switch to AI tracking for the duration of a call, then restore the previous mode. |
+| `callUnmute` | `false` | Unmute the camera's microphone when a call starts — only if it was muted. |
+
+The three `call*` settings have switches on the camera settings page too; see
+[When a call starts](#when-a-call-starts).
 
 Set them in the settings dialog, in `~/.config/omarchy/shell.json`, or from the CLI:
 
@@ -103,6 +118,7 @@ omarchy bar set nille.emeet-pixy refreshIntervalSec 15 --json
 omarchy bar set nille.emeet-pixy ptzStep 10 --json
 omarchy bar set nille.emeet-pixy hideWhenAbsent true --json
 omarchy bar set nille.emeet-pixy preview false --json
+omarchy bar set nille.emeet-pixy callOpenLens true --json
 ```
 
 `--json` is what distinguishes the number `15` and the boolean `true` from the strings `"15"` and
@@ -129,6 +145,9 @@ omarchy bar set nille.emeet-pixy preview false --json
 | Mic button, or right-click the mic slider | Mute or unmute |
 | Save on a preset row | Store the current framing |
 | Click a filled preset row, or its `×` | Recall it, or clear it |
+| **Camera settings** row | The camera's own firmware settings, snapshots, and call automation |
+| Focus pad, on that page | Aim the autofocus spot |
+| Snapshot button | Save a full-resolution still to `~/Pictures` |
 | Scroll anywhere in the panel | Scroll the panel |
 
 Scrolling always scrolls: the wheel deliberately does **not** adjust the slider under the cursor,
@@ -147,6 +166,7 @@ because a gesture aimed at the presets used to land on the pan slider and swing 
 | `v` | Turn the preview off/on |
 | `c` | Recenter |
 | `i` | Open or close the advanced image view |
+| `d` | Open or close the camera settings page |
 | `s` / `x` | Save the current framing into the preset under the cursor, or clear it |
 | `1` / `2` / `3` | Recall that preset |
 | `r` | Re-read the camera |
@@ -162,6 +182,11 @@ rather than numbered. On an image row `h`/`l` sweeps a slider, cycles a menu, or
 and on — `l` on, `h` off. On the name row `Enter` both focuses the field (suggesting a name if it is
 empty) and saves once there is one; while the field has focus it owns every key, and `Esc` hands it
 back.
+
+The camera settings page works the same way: `h`/`l` cycles a set of chips or moves a switch, `Enter`
+toggles or cycles the row, `x` clears the camera preset slot under the cursor, and `d` or `Esc` backs
+out. `1`–`3` are inert there too — three numbered rows on that page are the *camera's* slots, so
+recalling a framing preset from it would act on a list that is not on screen.
 
 ### Hyprland bindings
 
@@ -181,7 +206,9 @@ Available calls: `open`, `close`, `show`, `hide`, `toggle`, `privacyToggle`, `pr
 `tracking`, `standard`, `pan <degrees>`, `tilt <degrees>`, `nudge <left|right|up|down>`,
 `zoom <100-150>`, `home`, `preset <1-3>`, `micToggle`, `micOn`, `micOff`, `micVolume <0-100>`,
 `previewToggle`, `previewOn`, `previewOff`, `image <key> <value>`, `imageReset`, `profile <name>`,
-`refresh`, `state`.
+`audio <noise-cancel|live|original>`, `gesture <on|off>`, `mirror <on|off>`, `flip <on|off>`,
+`autoRotate <on|off>`, `focus <center|face|area>`, `focusSpot <x> <y>`, `autoPrivacy <seconds>`,
+`nativeClear <1-3>`, `snapshot`, `refresh`, `readDevice`, `state`.
 
 `micOn` and `micOff` are named for the microphone, not for muting: `micOff` mutes. `tracking` and
 `standard` do nothing on an idle camera — the firmware discards the write, see
@@ -201,9 +228,29 @@ bind = SUPER SHIFT, P, exec, quickshell -p $OMARCHY_PATH/shell ipc call nille.em
 it works before the panel has ever been opened — the value goes straight to the helper, which knows the
 real range and clamps.
 
+The firmware calls are worth binding for a different reason: they persist in the camera, so a key that
+sets one sets it for good rather than for the session.
+
+```
+bind = SUPER SHIFT, S, exec, quickshell -p $OMARCHY_PATH/shell ipc call nille.emeet-pixy snapshot
+bind = SUPER SHIFT, F, exec, quickshell -p $OMARCHY_PATH/shell ipc call nille.emeet-pixy mirror on
+```
+
+Every on/off call takes `on` or `off`; anything else means on, so `gesture` with no argument turns
+gestures on. There is no `toggle` form: these are read on demand rather than polled, so a toggle would
+flip whatever the last read said — which may be nothing at all. `focus area` re-aims at the last picked
+point; `focusSpot 0.5 0.5` centres it. `snapshot` returns immediately and the file path arrives in
+`state` a moment later.
+
 `state` adds `micPresent`, `micMuted`, `micVolume`, `image`, `imageProfiles`, `preview` and
 `previewActive` to the camera fields. The last two differ: `preview` is the setting, `previewActive` is
 whether an image is on screen, so a preview enabled but blocked by another app reads `true` and `false`.
+
+It also reports the firmware settings — `audio`, `gesture`, `mirror`, `flip`, `autoRotate`, `focus`,
+`focusSpot`, `autoPrivacy`, `nativePresets` — plus `snapshot`, `snapshotBusy`, `callActions` and
+`callActive`. Those are read on demand rather than polled, so they are `null` until something asks;
+`deviceRead` says whether anyone has, and `readDevice` is how a script asks. Without that flag there is
+no way to tell "gestures are off" from "nobody has looked yet".
 
 ## Image controls
 
@@ -249,6 +296,59 @@ Profiles do store held values, coming back inert until you turn that auto off. R
 to the driver's defaults with one exception — power line frequency, whose right value is a property of
 the room rather than the picture.
 
+## Camera settings
+
+The **Camera settings** row at the bottom of the panel — or `d` — opens a second page holding the
+things that live in the camera's own firmware rather than in the driver or in this widget:
+
+| Setting | What it is |
+| --- | --- |
+| Microphone mode | Noise cancelling, Live, or Original — the DSP chain on the camera's own mic |
+| Gesture control | Lets a raised hand start and stop the camera's tracking |
+| Autofocus target | Center, Face, or Spot, with a pad for aiming the spot |
+| Mirror / flip / auto-rotate | Orientation, applied in the camera |
+| Auto privacy | Close the lens by itself after 1, 5, or 15 minutes idle |
+| Camera preset slots | What the camera holds in its own three slots, and a way to clear one |
+
+Because these are firmware settings they **persist across reboots and apply to every app** — the mirror
+you set here is mirrored in Zoom, and it stays that way with this widget uninstalled. That is what makes
+them worth carrying, and also why they are on a page of their own instead of mixed in with the controls
+that only affect this session.
+
+The page is read on demand rather than polled: reading it is ten HID queries sharing one descriptor and
+costs about 0.6 s, and nothing here changes unless you or EMEET Studio changes it. A setting the camera
+would not answer for reads **"The camera did not report this"** and its switch is dimmed, rather than
+being drawn as off — "off" and "could not read" are different facts, and drawing the second as the first
+is how a panel ends up lying about hardware.
+
+Saving a framing preset also mirrors the position into the camera's slot of the same number, which is
+what makes them readable from EMEET Studio. Those slots hold pan and tilt only, so the framing preset
+keeps the zoom; the page says which slots are filled and lets you clear one, but saving happens through
+the framing presets above.
+
+### Snapshots
+
+One button, or `snapshot` on a keybinding, saves a full-resolution JPEG to `~/Pictures`. It needs the
+capture stream, so the panel's own preview yields for a moment and comes back — but another *app*
+holding the stream is a different matter and is not worked around: there is no way to grab a frame from
+a stream someone else owns, so the button says so.
+
+### When a call starts
+
+A call here is **any other app holding the video stream**, which needs no list of meeting apps: the
+panel already tracks who is capturing in order to yield the preview, and its own preview is excluded.
+Three optional actions, each off by default:
+
+- **Open the lens**, and close it again afterwards.
+- **Turn tracking on**, then restore the previous mode. Skipped when the camera will not say which mode
+  it is in, since restoring to a guess is worse than not touching it.
+- **Unmute the microphone** — only if it was muted to begin with.
+
+Each is reversed at the end of the call, and *only if this widget was what changed it*: a lens you opened
+by hand stays open, and a mic deliberately left on is never muted for you. The panel says what it did
+rather than doing it silently. The switches on the page and the three `call*` settings are the same
+values, so they cannot disagree.
+
 ## The microphone
 
 The PIXY's microphone is a plain PipeWire source — no vendor protocol, nothing for the helper to do —
@@ -282,6 +382,15 @@ that can take something away from a video call, and the only one that yields:
 Releasing quickly matters more than resuming quickly, so the two are polled differently: a cheap `pixy
 holders` call every 1.5 s while the preview holds the camera, and a resume riding the ordinary
 `refreshIntervalSec`.
+
+### Where the preview goes when you scroll
+
+Half these controls are judged by looking at the picture — mirror, focus, brightness, every image slider
+— and the panel is taller than the box that holds it, so the picture used to scroll off the top exactly
+when it was needed. Instead it now shrinks as its frame leaves the top edge and docks to the top-right
+corner of the viewport, floating over the rows, then slides back into place on the way up. There is still
+only one stream and one preview: it is the same picture, moved, not a second copy competing with the
+first for the device. Clicking it recenters the camera, docked or not.
 
 ### Turning the preview off
 
@@ -327,6 +436,27 @@ scripts/pixy profile list
 scripts/pixy profile clear "Evening call"
 scripts/pixy preview --text --blocks        # live preview, in the terminal
 ```
+
+The camera's own firmware settings, each readable by omitting the argument:
+
+```bash
+scripts/pixy vendor                         # every firmware setting at once
+scripts/pixy audio noise-cancel             # noise-cancel | live | original
+scripts/pixy gesture toggle                 # on | off | toggle
+scripts/pixy feature flipHorizontal on      # flipHorizontal | flipVertical | autoRotate
+scripts/pixy metering face                  # center | face | area
+scripts/pixy metering area --x 64 --y 32    # aim the spot, 0..127 from top left
+scripts/pixy autoprivacy 300                # idle shutter timeout in seconds; 0 is off
+scripts/pixy native list                    # the camera's own preset slots
+scripts/pixy native clear 2
+scripts/pixy snapshot                       # full-resolution still to ~/Pictures
+scripts/pixy formats                        # every capture format the camera offers
+```
+
+`vendor` is one call rather than seven because the queries share a descriptor; the panel uses it for the
+same reason. `formats` is read-only on purpose: a format belongs to whichever process holds the stream,
+so setting one from here would apply to this process's own capture and vanish when it exits. The list is
+the useful part — it says what to ask a meeting app for.
 
 `image` and `profile` work while another app holds the capture stream — they are control ioctls,
 not the stream. See [Image controls](#image-controls). Several `--set` flags in one call is not just
@@ -377,14 +507,18 @@ matched on file contents rather than process name, so unrelated Python programs 
 
 ## What it deliberately does not do
 
-- **Mirror, flip, auto-rotate, audio DSP, AI voice modes.** Set-once vendor settings, not something you
-  reach for from a bar. Mic mute and volume are here only because they are immediate and needed mid-call.
-- **Gesture control**, which belongs in whatever app is using the camera, and **choosing a different
-  microphone**, which is the bar's audio panel.
+- **Choosing a different microphone**, which is the bar's audio panel. Mute and volume are here only
+  because they are immediate and needed mid-call.
+- **Switching the capture format.** The panel lists every format the camera offers, but a format
+  belongs to whichever process holds the stream — setting one from here would apply to this process's
+  own read and vanish when it exits. The list is the part worth having: it says what to ask a meeting
+  app for.
 - **HID pan/tilt/zoom.** The camera supports it; using it desynchronizes the position readback
   permanently. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
-- **The camera's own preset slots.** They store positions in a coordinate space that does not match
-  the one this panel drives, so presets are stored locally instead.
+- **AI voice modes and anything else the firmware does not answer for.** Where a setting is present in
+  the vendor app but the camera returns nothing for it here, the page says the camera did not report it
+  rather than guessing. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for what was and was not confirmed
+  against hardware.
 
 ## Files
 
@@ -396,9 +530,10 @@ matched on file contents rather than process name, so unrelated Python programs 
 - `scripts/pixy` — the helper CLI: V4L2 ioctls, vendor HID, preset and profile storage
 - `docs/PROTOCOL.md` — the wire protocol, what was verified against hardware, and why several of the
   camera's features are unused
-- `tests/test_pixy.py` — 287 unit tests over the helper
-- `tests/qml/` — 164 QML tests: input routing, cursor arithmetic, and the `Model.js` functions that
-  need a JS engine rather than Python
+- `tests/test_pixy.py` — 396 unit tests over the helper
+- `tests/qml/` — 231 QML tests: input routing, cursor arithmetic, and the `Model.js` functions that
+  need a JS engine rather than Python — including the camera-settings page's row order, the call
+  automation's restore round trip, and where the preview is drawn as it docks
 - `tests/harness/shell.qml` — standalone window for developing the panel without a running Omarchy
   shell, launched by `tests/harness/run`
 - `preview.png` — composite of the screenshots above, at the repository root because that is where

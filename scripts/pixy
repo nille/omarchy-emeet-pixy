@@ -123,6 +123,38 @@ VIDIOC_DQBUF = _ioc(_IOC_READ | _IOC_WRITE, "V", 17, BUFFER_SIZE)
 VIDIOC_STREAMON = _ioc(_IOC_WRITE, "V", 18, STREAM_SIZE)
 VIDIOC_STREAMOFF = _ioc(_IOC_WRITE, "V", 19, STREAM_SIZE)
 
+# Format enumeration. Both are index-driven: call with index 0, 1, 2... until the
+# ioctl answers EINVAL, which is the terminator rather than an error.
+FMTDESC_SIZE = 64          # struct v4l2_fmtdesc
+FRAMESIZE_SIZE = 44        # struct v4l2_frmsizeenum
+FRAMEIVAL_SIZE = 52        # struct v4l2_frmivalenum
+
+VIDIOC_ENUM_FMT = _ioc(_IOC_READ | _IOC_WRITE, "V", 2, FMTDESC_SIZE)
+VIDIOC_ENUM_FRAMESIZES = _ioc(_IOC_READ | _IOC_WRITE, "V", 74, FRAMESIZE_SIZE)
+VIDIOC_ENUM_FRAMEINTERVALS = _ioc(_IOC_READ | _IOC_WRITE, "V", 75, FRAMEIVAL_SIZE)
+
+# struct v4l2_fmtdesc: index, type, flags, description[32], pixelformat, reserved[4]
+FMTDESC_FORMAT = "<III32sI16x"
+
+# Only discrete frame sizes and intervals are decoded. The kernel also defines
+# stepwise and continuous variants, whose payload is a different shape entirely;
+# this camera reports discrete for every mode, and decoding a stepwise struct as
+# discrete would silently report the wrong numbers.
+V4L2_FRMSIZE_TYPE_DISCRETE = 1
+V4L2_FRMIVAL_TYPE_DISCRETE = 1
+
+# struct v4l2_frmsizeenum: index, pixel_format, type, then the union, then
+# reserved[2]. Only the discrete arm is unpacked (width, height), but the trailing
+# padding must cover the *whole* union — the stepwise arm is six u32 where
+# discrete is two, so padding for discrete alone under-allocates by 16 bytes and
+# the ioctl fails as a buffer overflow rather than anything descriptive.
+FRAMESIZE_FORMAT = "<IIIII24x"
+
+# struct v4l2_frmivalenum: index, pixel_format, width, height, type, then the
+# union, then reserved[2]. Same union caveat as above; discrete is a v4l2_fract
+# (numerator, denominator).
+FRAMEIVAL_FORMAT = "<IIIIIII24x"
+
 
 def fourcc(code: str) -> int:
     return (ord(code[0]) | (ord(code[1]) << 8) | (ord(code[2]) << 16) | (ord(code[3]) << 24))
@@ -241,9 +273,41 @@ REPORT_SIZE = 32
 REPORT_ID = 0x09
 
 GROUP_TRACKING = 0x01
+GROUP_AUTOPRIVACY = 0x02
+GROUP_PRESET = 0x03
+GROUP_FEATURE = 0x04
+GROUP_AUDIO = 0x05
 
 MODE_VALUES = {"standard": 0x00, "tracking": 0x01, "privacy": 0x02}
 MODE_NAMES = {value: name for name, value in MODE_VALUES.items()}
+
+# The camera acknowledges a config write by answering the same command with this
+# byte where a value would be. It is an ack, not a state — reading it back as if
+# it were the new value is how you conclude a working write failed.
+ACK_BYTE = 0x20
+
+# Audio DSP mode, group 0x05. The camera runs the microphone through one of three
+# processing chains; this is the only microphone control the firmware exposes.
+AUDIO_MODES = {"noise-cancel": 0x01, "live": 0x02, "original": 0x03}
+AUDIO_NAMES = {value: name for name, value in AUDIO_MODES.items()}
+
+# Group 0x04 command 0x08 is a family of independent on/off features addressed by
+# a feature id. Manual 90-degree rotation is deliberately absent: EMEET Studio's
+# rotate buttons produce no USB traffic at all, so rotation there is a host-side
+# transform of the preview, not a camera setting. Only these three are real.
+FEATURE_IDS = {"flipHorizontal": 0x01, "flipVertical": 0x02, "autoRotate": 0x04}
+
+# Focus metering, group 0x04 commands 0x01 (set) and 0x03 (commit). This chooses
+# *what* the autofocus aims at, and is independent of the UVC focus controls that
+# choose auto-versus-manual.
+METERING_MODES = {"center": 0x00, "face": 0x01, "area": 0x02}
+METERING_NAMES = {value: name for name, value in METERING_MODES.items()}
+
+# Selected-area coordinates are a 0..0x7F grid with the origin at top left. The
+# trailing pair was 0x7F 0x7F for every captured click, so it is sent as-is
+# rather than guessed at.
+METERING_MAX = 0x7F
+METERING_SENTINEL = 0x7F
 
 # A vendor query is a write followed by a read on the same fd. The camera can
 # answer slowly enough that a single attempt misses the reply, and a reply left
@@ -253,21 +317,44 @@ QUERY_TIMEOUT = 0.6
 QUERY_ATTEMPTS = 4
 REPORT_GAP = 0.025
 
+# Setters confirm by reading back, and retry once when the camera did not take
+# the write — the first write after an idle period gets dropped. See
+# `set_and_confirm`.
+SET_ATTEMPTS = 2
+SET_SETTLE = 0.2
+
 # How long the motors need for a full sweep before a readback means anything.
 PTZ_SETTLE = 0.35
 
 PRESET_SLOTS = (1, 2, 3)
 
+SNAPSHOT_NAME = "pixy-snapshot.jpg"
+
+
+def snapshot_default() -> str:
+    """Where snapshots go when no --output is given.
+
+    Resolved as a function rather than a constant so the environment is read when
+    the snapshot is taken. `os.path.expandvars` understands `$VAR` but not the
+    shell's `${VAR:-fallback}`, so the fallback is spelled out here instead of
+    hidden in a string that would silently expand to nothing.
+    """
+    pictures = os.environ.get("XDG_PICTURES_DIR") or os.path.join(
+        os.path.expanduser("~"), "Pictures"
+    )
+    return os.path.join(pictures, SNAPSHOT_NAME)
+
 
 def state_path() -> str:
     """Where saved framing presets and image profiles live.
 
-    Presets are stored on this machine rather than in the camera's own preset
-    slots. The camera has three HID slots, but they hold positions in the HID
-    coordinate space, which testing showed does not agree with the UVC space
-    the panel drives — a slot saved by this panel and loaded by EMEET Studio
-    would point somewhere else. Keeping them local means "save" and "load" are
-    exact inverses, which is the only behavior worth shipping.
+    The local store is the authority for framing presets, and the reason is
+    zoom: the camera's own three slots hold pan and tilt only, so a preset kept
+    solely there would silently forget the zoom level it was saved at. Saving
+    also mirrors into the camera's slot of the same number (see
+    `mirror_native`), so a preset made here is visible to EMEET Studio and
+    survives a reboot — but "save" and "load" are exact inverses because of what
+    is in this file, not what is in the camera.
 
     One file, two independent stores under separate keys — see `read_store`.
     """
@@ -387,7 +474,7 @@ def capability(fd: int) -> dict | None:
 # Subcommands that open the capture stream. Every *other* subcommand opens the
 # video node too — the control ioctls need an fd — but only these ones capture,
 # and that distinction is what is_control_helper exists to draw.
-CAPTURING_COMMANDS = frozenset({"preview"})
+CAPTURING_COMMANDS = frozenset({"preview", "snapshot"})
 
 SELF_PATH = os.path.realpath(__file__)
 
@@ -572,6 +659,84 @@ def enumerate_menu(fd: int, cid: int, lo: int, hi: int) -> list:
     return options
 
 
+def fourcc_name(code: int) -> str:
+    """Turn a packed pixel format back into its four characters."""
+    return "".join(chr((code >> shift) & 0xFF) for shift in (0, 8, 16, 24)).strip()
+
+
+def enumerate_intervals(fd: int, pixel_format: int, width: int, height: int) -> list:
+    """Frame rates offered for one format at one size, highest first.
+
+    Reported as frames per second rather than the kernel's interval fraction,
+    because a duration in seconds is not what anyone picking a mode is thinking
+    in. Non-discrete entries are skipped — see V4L2_FRMIVAL_TYPE_DISCRETE.
+    """
+    rates = []
+    for index in range(64):
+        buf = bytearray(struct.pack(FRAMEIVAL_FORMAT, index, pixel_format,
+                                    width, height, 0, 0, 0))
+        try:
+            fcntl.ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, buf, True)
+        except OSError:
+            break
+        _i, _pf, _w, _h, kind, numerator, denominator = struct.unpack(
+            FRAMEIVAL_FORMAT, bytes(buf)
+        )
+        if kind != V4L2_FRMIVAL_TYPE_DISCRETE or not numerator:
+            continue
+        rates.append(round(denominator / numerator, 3))
+    return sorted(set(rates), reverse=True)
+
+
+def enumerate_framesizes(fd: int, pixel_format: int) -> list:
+    """Frame sizes offered for one pixel format, largest first."""
+    sizes = []
+    for index in range(64):
+        buf = bytearray(struct.pack(FRAMESIZE_FORMAT, index, pixel_format, 0, 0, 0))
+        try:
+            fcntl.ioctl(fd, VIDIOC_ENUM_FRAMESIZES, buf, True)
+        except OSError:
+            break
+        _i, _pf, kind, width, height = struct.unpack(FRAMESIZE_FORMAT, bytes(buf))
+        if kind != V4L2_FRMSIZE_TYPE_DISCRETE or not width or not height:
+            continue
+        sizes.append({
+            "width": width,
+            "height": height,
+            "fps": enumerate_intervals(fd, pixel_format, width, height),
+        })
+    sizes.sort(key=lambda s: s["width"] * s["height"], reverse=True)
+    return sizes
+
+
+def enumerate_formats(fd: int) -> list:
+    """Every capture format the camera offers, with sizes and frame rates.
+
+    Three nested index-driven enumerations, each terminated by EINVAL. The bound
+    on each loop is a guard against a driver that never returns EINVAL rather than
+    a real limit — no UVC camera comes close to 64 of anything here.
+    """
+    formats = []
+    for index in range(64):
+        buf = bytearray(struct.pack(FMTDESC_FORMAT, index,
+                                    V4L2_BUF_TYPE_VIDEO_CAPTURE, 0, b"", 0))
+        try:
+            fcntl.ioctl(fd, VIDIOC_ENUM_FMT, buf, True)
+        except OSError:
+            break
+        _i, _type, flags, description, pixel_format = struct.unpack(
+            FMTDESC_FORMAT, bytes(buf)
+        )
+        formats.append({
+            "fourcc": fourcc_name(pixel_format),
+            "pixelFormat": pixel_format,
+            "description": description.split(b"\0")[0].decode("utf-8", "replace"),
+            "compressed": bool(flags & 0x0001),
+            "sizes": enumerate_framesizes(fd, pixel_format),
+        })
+    return formats
+
+
 def get_control(fd: int, cid: int) -> int | None:
     buf = bytearray(struct.pack(CTRL_FORMAT, cid, 0))
     try:
@@ -685,21 +850,70 @@ def drain(fd: int) -> None:
             return
 
 
-def query(path: str, payload) -> bytes | None:
+class HidSession:
+    """One open fd reused across several queries.
+
+    Worth its own class because of a measured quirk: the first write to a
+    freshly-opened hidraw fd is silently lost, so the first attempt always times
+    out and every query pays QUERY_TIMEOUT before its retry succeeds. The reply
+    itself arrives in ~30 ms. Reopening per query — which is what a bare `query`
+    call does — therefore costs ~750 ms each, and reading ten features cost 8.4 s.
+
+    Holding the fd open pays that penalty once for the whole batch, so the same
+    ten reads cost roughly a third of a second. Use this whenever more than one
+    query is issued together; `query` remains for one-offs.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.fd: int | None = None
+
+    def __enter__(self) -> "HidSession":
+        self.fd = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def query(self, payload) -> bytes | None:
+        return query(self.path, payload, fd=self.fd)
+
+
+def query(path: str, payload, fd: int | None = None) -> bytes | None:
     """Send a vendor query and return the matching reply, or None.
 
-    Replies are matched on report id and command group, because the camera
-    emits unsolicited status reports too — accepting the first thing that
-    arrives decodes another group's payload as if it were ours. The group byte
-    can carry high bits set, so it is masked before comparing.
+    Replies are matched on report id, command group, and the two command bytes
+    that follow it, because the camera emits unsolicited status reports too —
+    accepting the first thing that arrives decodes some other message's payload
+    as if it were ours.
+
+    Matching the command bytes and not just the group is load-bearing. A group
+    holds several commands: 0x05 carries both `00 03` (set audio mode) and
+    `00 04` (read it). A group-only match therefore accepts a *set*
+    acknowledgement as the answer to a read issued right after it, and an ack
+    carries 0x20 where the value belongs — so a setter that reads back to confirm
+    itself sees 0x20, decodes it as no known mode, and reports a successful write
+    as failed. Every group in use echoes these bytes; verified against the device.
+
+    The group byte comes back with high bits set, so it is masked; the two
+    command bytes come back verbatim.
+
+    Pass `fd` to reuse an already-open descriptor — see `HidSession`, which is
+    what makes reading many features cheap. Without it a fresh fd is opened and
+    closed per attempt, and the first write on a new fd is lost.
     """
     report = build_report(payload)
     group = report[1] & 0x1F
+    command = report[2:4]
+    borrowed = fd is not None
     for _ in range(QUERY_ATTEMPTS):
-        try:
-            fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
-        except OSError:
-            return None
+        if not borrowed:
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            except OSError:
+                return None
         try:
             drain(fd)
             os.write(fd, report)
@@ -716,10 +930,12 @@ def query(path: str, payload) -> bytes | None:
                     continue
                 except OSError:
                     break
-                if reply and reply[0] == REPORT_ID and (reply[1] & 0x1F) == group:
+                if (reply and len(reply) >= 4 and reply[0] == REPORT_ID
+                        and (reply[1] & 0x1F) == group and reply[2:4] == command):
                     return reply
         finally:
-            os.close(fd)
+            if not borrowed:
+                os.close(fd)
         time.sleep(REPORT_GAP)
     return None
 
@@ -751,6 +967,132 @@ def read_mode(path: str, streaming: bool = True) -> tuple[str | None, int | None
         return None, None
     raw = reply[8]
     return MODE_NAMES.get(raw), raw
+
+
+# ---------------------------------------------------------------- vendor features
+#
+# Everything below speaks the same 32-byte report as the mode commands. Each
+# feature follows one shape: a set report, then a query whose reply carries the
+# value the camera now holds. Nothing here trusts a write — every setter reads
+# back, because the camera silently ignores some writes (see `read_mode`) and a
+# write-only setter would report success for a command that did nothing.
+
+
+def audio_report(mode: str) -> list[bytes]:
+    return [build_report([0x09, GROUP_AUDIO, 0x00, 0x03, 0x00, 0x01, 0x00, 0x01,
+                          AUDIO_MODES[mode]])]
+
+
+def read_audio(path: str, fd: int | None = None) -> tuple[str | None, int | None]:
+    """Read the audio DSP mode. Returns (name or None, raw byte or None)."""
+    reply = query(path, [0x09, GROUP_AUDIO, 0x00, 0x04], fd=fd)
+    if not reply or len(reply) < 9:
+        return None, None
+    raw = reply[8]
+    return AUDIO_NAMES.get(raw), raw
+
+
+def gesture_report(enabled: bool) -> list[bytes]:
+    return [build_report([0x09, GROUP_FEATURE, 0x02, 0x00, 0x00, 0x02, 0x00, 0x02,
+                          0x02, 0x01 if enabled else 0x00])]
+
+
+def read_gesture(path: str, fd: int | None = None) -> bool | None:
+    """Read whether gesture control is on. None when the camera does not answer.
+
+    The value is at byte 9, not the last byte of the report. Reports are
+    zero-padded to 32 bytes, so reading from the end always yields 0 — which
+    looks exactly like "gesture is off" and is the bug in at least one other
+    Linux tool for this camera.
+    """
+    reply = query(path, [0x09, GROUP_FEATURE, 0x02, 0x01, 0x00, 0x01, 0x00, 0x01, 0x02],
+                  fd=fd)
+    if not reply or len(reply) < 10:
+        return None
+    return bool(reply[9])
+
+
+def feature_report(key: str, enabled: bool) -> list[bytes]:
+    return [build_report([0x09, GROUP_FEATURE, 0x00, 0x08, 0x00, 0x02, 0x00, 0x02,
+                          FEATURE_IDS[key], 0x01 if enabled else 0x00])]
+
+
+def read_feature(path: str, key: str, fd: int | None = None) -> bool | None:
+    """Read one group 0x04 toggle. None when the camera does not answer."""
+    reply = query(path, [0x09, GROUP_FEATURE, 0x00, 0x07, 0x00, 0x01, 0x00, 0x01,
+                         FEATURE_IDS[key]], fd=fd)
+    if not reply or len(reply) < 10:
+        return None
+    return bool(reply[9])
+
+
+def metering_report(mode: str, x: int = 0, y: int = 0) -> list[bytes]:
+    """Build the focus-metering set sequence.
+
+    Two writes, then the caller queries. Command 0x01 stages the mode and 0x03
+    commits it; EMEET Studio sends both with the same payload and the camera does
+    not act on 0x01 alone.
+    """
+    value = METERING_MODES[mode]
+    payload = [value, x, y, METERING_SENTINEL, METERING_SENTINEL]
+    return [
+        build_report([0x09, GROUP_FEATURE, 0x00, 0x01, 0x00, 0x05, 0x00, 0x05, *payload]),
+        build_report([0x09, GROUP_FEATURE, 0x00, 0x03, 0x00, 0x05, 0x00, 0x05, *payload]),
+    ]
+
+
+def read_metering(path: str, fd: int | None = None) -> dict | None:
+    """Read the focus-metering mode and its target point.
+
+    The x/y bytes persist after leaving `area` mode — the camera keeps the last
+    picked point rather than clearing it — so they are only meaningful when the
+    mode is `area`, and are reported alongside it rather than as state of their
+    own.
+    """
+    reply = query(path, [0x09, GROUP_FEATURE, 0x00, 0x02], fd=fd)
+    if not reply or len(reply) < 11:
+        return None
+    raw = reply[8]
+    return {"mode": METERING_NAMES.get(raw), "raw": raw, "x": reply[9], "y": reply[10]}
+
+
+def native_preset_report(slot: int, saved: bool = True) -> list[bytes]:
+    """Save the camera's current position into one of its own slots, or clear it.
+
+    No coordinates are sent: the camera stores wherever it is currently pointing.
+    The enable byte is what distinguishes save from erase.
+    """
+    return [build_report([0x09, GROUP_PRESET, 0x01, 0x15, 0x00, 0x02, 0x00, 0x02,
+                          slot, 0x01 if saved else 0x00])]
+
+
+def read_native_preset(path: str, slot: int, fd: int | None = None) -> dict | None:
+    """Read one native slot as {saved, pan, tilt}, or None if unreadable.
+
+    The stored floats are degrees in the same space as the UVC pan/tilt readback:
+    saving at UVC pan=-35.0 stores -34.969. That is what makes loading a slot
+    over UVC possible at all — see `load_native_preset`. The third float was 0.0
+    in every reading here and in the reference captures, so it is not decoded.
+    """
+    reply = query(path, [0x09, GROUP_PRESET, 0x01, 0x16, 0x00, 0x01, 0x00, 0x01, slot],
+                  fd=fd)
+    if not reply or len(reply) < 22:
+        return None
+    pan, tilt, _third = struct.unpack("<fff", bytes(reply[10:22]))
+    return {"slot": slot, "saved": bool(reply[9]), "pan": pan, "tilt": tilt}
+
+
+def read_autoprivacy(path: str, fd: int | None = None) -> int | None:
+    """Seconds of inactivity before the camera closes its own shutter; 0 is off."""
+    reply = query(path, [0x09, GROUP_AUTOPRIVACY, 0x01, 0x01], fd=fd)
+    if not reply or len(reply) < 12:
+        return None
+    return int.from_bytes(reply[8:12], "little")
+
+
+def autoprivacy_report(seconds: int) -> list[bytes]:
+    return [build_report([0x09, GROUP_AUTOPRIVACY, 0x01, 0x00, 0x00, 0x04, 0x00, 0x04,
+                          *seconds.to_bytes(4, "little")])]
 
 
 # ---------------------------------------------------------------- saved state
@@ -887,10 +1229,12 @@ class Capture:
     acquisition step is undone in __exit__, in reverse.
     """
 
-    def __init__(self, node: str, width: int = CAPTURE_WIDTH, height: int = CAPTURE_HEIGHT):
+    def __init__(self, node: str, width: int = CAPTURE_WIDTH, height: int = CAPTURE_HEIGHT,
+                 pixel_format: int = PIXFMT_YUYV):
         self.node = node
         self.width = width
         self.height = height
+        self.pixel_format = pixel_format
         self.fd: int | None = None
         self.buffers: list = []
         self.streaming = False
@@ -944,15 +1288,17 @@ class Capture:
         buf = bytearray(FORMAT_SIZE)
         struct.pack_into("<I", buf, 0, V4L2_BUF_TYPE_VIDEO_CAPTURE)
         # struct v4l2_pix_format starts at offset 8 (after type + 4 bytes pad).
-        struct.pack_into("<IIII", buf, 8, self.width, self.height, PIXFMT_YUYV, V4L2_FIELD_NONE)
+        struct.pack_into("<IIII", buf, 8, self.width, self.height,
+                         self.pixel_format, V4L2_FIELD_NONE)
         fcntl.ioctl(self.fd, VIDIOC_S_FMT, buf, True)
         # The driver rewrites these to what it actually accepted, so read them
         # back rather than trusting the request — a size that was silently
         # adjusted would misalign every row of the output.
         self.width, self.height = struct.unpack_from("<II", buf, 8)
         pixfmt = struct.unpack_from("<I", buf, 16)[0]
-        if pixfmt != PIXFMT_YUYV:
-            raise OSError(errno.ENODEV, "camera would not accept YUYV")
+        if pixfmt != self.pixel_format:
+            raise OSError(errno.ENODEV,
+                          f"camera would not accept {fourcc_name(self.pixel_format)}")
         self.bytes_per_line = struct.unpack_from("<I", buf, 24)[0] or self.width * 2
 
     def _request_buffers(self) -> None:
@@ -1504,6 +1850,300 @@ def cmd_toggle_privacy(args) -> dict:
     return cmd_mode(args)
 
 
+def with_hid(action) -> dict:
+    """Run `action` against the vendor HID node, turning failure into data.
+
+    The counterpart to `with_camera`. Both surfaces can be absent independently:
+    a camera with no udev rule has a capture node and no writable hidraw, which
+    is the single most common way this plugin is half-working.
+    """
+    hid = find_hidraw()
+    if not hid:
+        return {"ok": False, "error": "vendor HID interface not found", "present": False}
+    try:
+        return action(hid)
+    except OSError as exc:
+        return {"ok": False, "error": describe(exc), "hidraw": hid}
+
+
+def set_and_confirm(hid: str, reports: list[bytes], read, expected) -> dict:
+    """Write, wait, read back, and retry once if the camera did not take it.
+
+    Every vendor setter goes through here so that "ok" means the camera agreed,
+    not merely that the write returned. The camera ignores some writes outright
+    (see `read_mode`), so an unconfirmed result is a real outcome worth showing
+    rather than an error to hide.
+
+    The retry exists because the *first* write after an idle period is dropped:
+    the same command that fails cold succeeds on every immediately following
+    attempt. Rather than special-case one command, retry any write whose readback
+    disagrees — a setter that has already confirmed exits on the first pass, so
+    this costs nothing in the normal case.
+    """
+    actual = None
+    for attempt in range(SET_ATTEMPTS):
+        write_reports(hid, reports)
+        time.sleep(SET_SETTLE)
+        actual = read(hid)
+        if actual == expected:
+            return {"ok": True, "requested": expected, "actual": actual,
+                    "confirmed": True, "attempts": attempt + 1}
+    return {
+        "ok": True,
+        "requested": expected,
+        "actual": actual,
+        "confirmed": False,
+        "attempts": SET_ATTEMPTS,
+    }
+
+
+def cmd_vendor(args) -> dict:
+    """Every vendor feature in one call.
+
+    Deliberately not folded into `state`. Each of these is a separate HID query
+    with its own retry budget, and `state` is polled on a timer — adding them
+    there would multiply the cost of the panel's most frequent call for values
+    that only one tab ever shows. The panel reads this when that tab opens.
+
+    A feature the camera does not answer for is reported as null rather than
+    omitted, so the panel can distinguish "off" from "could not read".
+    """
+    def action(hid: str) -> dict:
+        # One shared fd for all ten reads: see HidSession for why this is a 25x
+        # difference rather than a micro-optimization.
+        with HidSession(hid) as session:
+            fd = session.fd
+            audio, audio_raw = read_audio(hid, fd=fd)
+            return {
+                "ok": True,
+                "hidraw": hid,
+                "audio": audio,
+                "audioRaw": audio_raw,
+                "gesture": read_gesture(hid, fd=fd),
+                "features": {
+                    key: read_feature(hid, key, fd=fd) for key in FEATURE_IDS
+                },
+                "metering": read_metering(hid, fd=fd),
+                "autoPrivacy": read_autoprivacy(hid, fd=fd),
+                "nativePresets": {
+                    str(slot): read_native_preset(hid, slot, fd=fd)
+                    for slot in PRESET_SLOTS
+                },
+            }
+
+    return with_hid(action)
+
+
+def snapshot_path(template: str) -> str:
+    """Expand a snapshot filename, creating the directory it lives in.
+
+    `~` and environment variables are expanded so the default lands somewhere
+    sensible, and the counter suffix only appears when it has to — a snapshot
+    named `shot.jpg` should be `shot.jpg`, not `shot-1.jpg`, the first time.
+    """
+    path = os.path.abspath(os.path.expanduser(os.path.expandvars(template)))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        return path
+    stem, extension = os.path.splitext(path)
+    for index in range(1, 1000):
+        candidate = f"{stem}-{index}{extension}"
+        if not os.path.exists(candidate):
+            return candidate
+    raise OSError(errno.EEXIST, "too many snapshots with that name")
+
+
+def cmd_snapshot(args) -> dict:
+    """Save a still to a file, at the camera's full resolution.
+
+    MJPEG is the format asked for, not YUYV, and that is the whole trick: an
+    MJPEG frame off this camera is already a complete JPEG file, so a full 4K
+    still is the buffer written to disk verbatim — no encoder, no decoder, and no
+    dependency beyond the standard library. YUYV would need both, and only comes
+    in 640x480 anyway.
+
+    This takes the stream, so it fails with EBUSY while a meeting app is running.
+    That is reported as data rather than papered over: there is no way to grab a
+    frame from a stream someone else holds.
+    """
+    node = find_video()
+    if not node:
+        return missing_camera()
+
+    def largest_mjpeg() -> dict | None:
+        try:
+            with Camera(node) as cam:
+                for entry in enumerate_formats(cam.fd):
+                    if entry["fourcc"] == "MJPG" and entry["sizes"]:
+                        return entry["sizes"][0]
+        except OSError:
+            return None
+        return None
+
+    width, height = args.width, args.height
+    if not width or not height:
+        # Default to the biggest still the camera offers, since a snapshot is the
+        # one case where resolution is the entire point.
+        biggest = largest_mjpeg()
+        if not biggest:
+            return {"ok": False, "present": True,
+                    "error": "camera reported no MJPEG sizes"}
+        width, height = biggest["width"], biggest["height"]
+
+    try:
+        path = snapshot_path(args.output or snapshot_default())
+    except OSError as exc:
+        return {"ok": False, "error": describe(exc)}
+
+    try:
+        with Capture(node, width, height, fourcc("MJPG")) as cap:
+            # Discard the settling frames: the first frames after STREAMON are
+            # dark or half-exposed, and a snapshot has no later frame to redeem
+            # it the way a preview does.
+            for _ in range(max(0, args.warmup)):
+                cap.frame()
+            data = cap.frame()
+            captured = (cap.width, cap.height)
+    except OSError as exc:
+        return {"ok": False, "present": True, "error": describe(exc),
+                "busy": exc.errno == errno.EBUSY}
+
+    if not data.startswith(b"\xff\xd8"):
+        # A JPEG starts with SOI. Anything else means the driver handed back a
+        # frame in some other format, and writing it to a .jpg would produce a
+        # file nothing can open.
+        return {"ok": False, "present": True,
+                "error": "captured frame is not JPEG data"}
+
+    try:
+        with open(path, "wb") as fh:
+            fh.write(data)
+    except OSError as exc:
+        return {"ok": False, "error": describe(exc), "path": path}
+
+    return {
+        "ok": True,
+        "path": path,
+        "bytes": len(data),
+        "width": captured[0],
+        "height": captured[1],
+        "format": "MJPG",
+    }
+
+
+def cmd_formats(args) -> dict:
+    """Every capture format, size, and frame rate the camera advertises.
+
+    Read-only, and deliberately so. Switching format is not a camera setting: a
+    format belongs to whoever holds the stream, so setting one here would apply
+    to this process's own capture and vanish when it exits. The useful thing to
+    ship is the list — it tells you what to ask your meeting app for, and it is
+    what `v4l2-ctl --list-formats-ext` would tell you if it were installed.
+    """
+    def action(cam: Camera) -> dict:
+        formats = enumerate_formats(cam.fd)
+        return {"ok": bool(formats), "formats": formats,
+                "capture": {"width": CAPTURE_WIDTH, "height": CAPTURE_HEIGHT,
+                            "fourcc": fourcc_name(PIXFMT_YUYV)}}
+
+    return with_camera(action)
+
+
+def cmd_audio(args) -> dict:
+    """Read or set the microphone's DSP mode."""
+    def action(hid: str) -> dict:
+        if args.mode is None:
+            name, raw = read_audio(hid)
+            return {"ok": name is not None, "audio": name, "audioRaw": raw}
+        if args.mode not in AUDIO_MODES:
+            return {"ok": False, "error": f"unknown audio mode: {args.mode}"}
+        result = set_and_confirm(
+            hid, audio_report(args.mode), lambda p: read_audio(p)[0], args.mode
+        )
+        result["audio"] = result["actual"]
+        return result
+
+    return with_hid(action)
+
+
+def cmd_gesture(args) -> dict:
+    """Read or set gesture control."""
+    def action(hid: str) -> dict:
+        if args.state is None:
+            current = read_gesture(hid)
+            return {"ok": current is not None, "gesture": current}
+        target = args.state == "on"
+        if args.state == "toggle":
+            current = read_gesture(hid)
+            if current is None:
+                return {"ok": False, "error": "could not read gesture state to toggle"}
+            target = not current
+        result = set_and_confirm(hid, gesture_report(target), read_gesture, target)
+        result["gesture"] = result["actual"]
+        return result
+
+    return with_hid(action)
+
+
+def cmd_feature(args) -> dict:
+    """Read or set one of the group 0x04 image-orientation toggles."""
+    def action(hid: str) -> dict:
+        if args.name is None:
+            return {"ok": True,
+                    "features": {key: read_feature(hid, key) for key in FEATURE_IDS}}
+        if args.name not in FEATURE_IDS:
+            return {"ok": False, "error": f"unknown feature: {args.name}",
+                    "known": sorted(FEATURE_IDS)}
+        if args.state is None:
+            current = read_feature(hid, args.name)
+            return {"ok": current is not None, "feature": args.name, "value": current}
+        target = args.state == "on"
+        if args.state == "toggle":
+            current = read_feature(hid, args.name)
+            if current is None:
+                return {"ok": False, "error": f"could not read {args.name} to toggle"}
+            target = not current
+        result = set_and_confirm(
+            hid, feature_report(args.name, target),
+            lambda p: read_feature(p, args.name), target
+        )
+        result.update({"feature": args.name, "value": result["actual"]})
+        return result
+
+    return with_hid(action)
+
+
+def cmd_metering(args) -> dict:
+    """Read or set what the autofocus aims at."""
+    def action(hid: str) -> dict:
+        if args.mode is None:
+            current = read_metering(hid)
+            return {"ok": current is not None, "metering": current}
+        if args.mode not in METERING_MODES:
+            return {"ok": False, "error": f"unknown metering mode: {args.mode}",
+                    "known": sorted(METERING_MODES)}
+        x, y = args.x, args.y
+        if args.mode == "area":
+            if x is None or y is None:
+                return {"ok": False,
+                        "error": "area metering needs --x and --y"}
+            if not (0 <= x <= METERING_MAX and 0 <= y <= METERING_MAX):
+                return {"ok": False,
+                        "error": f"--x/--y must be within 0..{METERING_MAX}"}
+        else:
+            # Non-area modes carry no point. The camera keeps the previous x/y
+            # bytes regardless, so sending zeros here is cosmetic, not a reset.
+            x, y = 0, 0
+        result = set_and_confirm(
+            hid, metering_report(args.mode, x, y),
+            lambda p: (read_metering(p) or {}).get("mode"), args.mode
+        )
+        result["metering"] = read_metering(hid)
+        return result
+
+    return with_hid(action)
+
+
 def apply_ptz(cam: Camera, pan=None, tilt=None, zoom=None) -> dict:
     """Write whichever axes were asked for and report the readback."""
     written, failed = {}, {}
@@ -1745,6 +2385,31 @@ def cmd_zoom(args) -> dict:
     return with_camera(action)
 
 
+def mirror_native(slot: int, saved: bool) -> dict | None:
+    """Write a framing preset through to the camera's own slot of the same number.
+
+    Best-effort by design, and never fatal: the local store is the authority
+    because it also holds zoom, which the camera's slots do not. The mirror is
+    what makes a preset saved here show up in EMEET Studio and survive a reboot
+    or a different host — worth having, not worth failing a save over.
+
+    Returns None when there is no vendor HID node at all, which is the ordinary
+    state of a camera whose udev rule is not installed.
+    """
+    hid = find_hidraw()
+    if not hid:
+        return None
+    try:
+        return set_and_confirm(
+            hid,
+            native_preset_report(slot, saved=saved),
+            lambda p: (read_native_preset(p, slot) or {}).get("saved"),
+            saved,
+        )
+    except OSError as exc:
+        return {"ok": False, "error": describe(exc)}
+
+
 def cmd_preset(args) -> dict:
     slot = int(args.slot)
     if slot not in PRESET_SLOTS:
@@ -1756,6 +2421,7 @@ def cmd_preset(args) -> dict:
         if not write_presets(slots):
             return {"ok": False, "error": "could not write the preset store"}
         return {"ok": True, "slot": slot, "cleared": True,
+                "native": None if args.local else mirror_native(slot, False),
                 "presets": {str(k): v for k, v in slots.items()}}
 
     if args.action == "save":
@@ -1773,7 +2439,11 @@ def cmd_preset(args) -> dict:
             slots[slot] = entry
             if not write_presets(slots):
                 return {"ok": False, "error": "could not write the preset store"}
+            # After the local write, so a mirror that fails cannot lose the
+            # preset. The camera stores wherever the lens is now, which is the
+            # same position just read back — no coordinates are sent.
             return {"ok": True, "slot": slot, "saved": entry,
+                    "native": None if args.local else mirror_native(slot, True),
                     "presets": {str(k): v for k, v in slots.items()}}
 
         return with_camera(save)
@@ -1790,6 +2460,102 @@ def cmd_preset(args) -> dict:
         return result
 
     return with_camera(load)
+
+
+def cmd_native_preset(args) -> dict:
+    """Save, load, clear, or list the camera's own three PTZ preset slots.
+
+    These are the slots EMEET Studio uses, stored in the camera, so a slot saved
+    here survives a reboot and shows up in the vendor app. That is the whole
+    reason to use them over the local store — which stays, because it also keeps
+    zoom, and these slots do not.
+
+    Load deliberately does not use the vendor load command. The camera
+    acknowledges `0x18` and does not move: verified by holding a stream open,
+    setting Standard mode, and comparing sampled frames before and after against
+    a calibrated baseline. Instead, load reads the slot's stored degrees over HID
+    and drives the lens there over UVC. The stored floats are in the same space
+    as the UVC readback, so this lands on the saved position *and* keeps the
+    position readout truthful — which sending HID motion commands would not.
+    """
+    slot = int(args.slot) if args.slot is not None else None
+    if args.action != "list" and slot not in PRESET_SLOTS:
+        return {"ok": False, "error": f"preset slot must be one of {list(PRESET_SLOTS)}"}
+
+    hid = find_hidraw()
+    if not hid:
+        return {"ok": False, "error": "vendor HID interface not found", "present": False}
+
+    def listing() -> dict:
+        return {str(n): read_native_preset(hid, n) for n in PRESET_SLOTS}
+
+    try:
+        if args.action == "list":
+            return {"ok": True, "nativePresets": listing()}
+
+        if args.action in ("save", "clear"):
+            expected = args.action == "save"
+            result = set_and_confirm(
+                hid,
+                native_preset_report(slot, saved=expected),
+                lambda p: (read_native_preset(p, slot) or {}).get("saved"),
+                expected,
+            )
+            result.update({
+                "slot": slot,
+                "action": args.action,
+                "entry": read_native_preset(hid, slot),
+                "nativePresets": listing(),
+            })
+            return result
+
+        entry = read_native_preset(hid, slot)
+    except OSError as exc:
+        return {"ok": False, "error": describe(exc), "hidraw": hid}
+
+    if not entry:
+        return {"ok": False, "error": "could not read the slot", "slot": slot}
+    if not entry["saved"]:
+        return {"ok": False, "error": "empty", "slot": slot,
+                "nativePresets": listing()}
+
+    def load(cam: Camera) -> dict:
+        result = apply_ptz(cam, pan=entry["pan"], tilt=entry["tilt"])
+        time.sleep(PTZ_SETTLE)
+        for key, cid in (("pan", CID_PAN_ABSOLUTE), ("tilt", CID_TILT_ABSOLUTE)):
+            raw = cam.get(cid)
+            if raw is not None:
+                result[key] = raw // ARCSEC_PER_DEGREE
+        result.update({"ok": not result["failed"], "slot": slot, "action": "load",
+                       "loaded": entry})
+        return result
+
+    return with_camera(load)
+
+
+def cmd_autoprivacy(args) -> dict:
+    """Read or set the camera's own idle shutter timeout.
+
+    This runs in the camera, not here: after N seconds with no stream the lens
+    closes itself, and it stays closed across a reboot or a different host. 0
+    disables it. Nothing in this plugin needs to be running for it to work, which
+    is exactly why it is worth exposing.
+    """
+    def action(hid: str) -> dict:
+        if args.seconds is None:
+            current = read_autoprivacy(hid)
+            return {"ok": current is not None, "autoPrivacy": current}
+        if args.seconds < 0:
+            return {"ok": False, "error": "--seconds cannot be negative"}
+        if args.seconds > 0xFFFFFFFF:
+            return {"ok": False, "error": "--seconds is a 32-bit value"}
+        result = set_and_confirm(
+            hid, autoprivacy_report(args.seconds), read_autoprivacy, args.seconds
+        )
+        result["autoPrivacy"] = result["actual"]
+        return result
+
+    return with_hid(action)
 
 
 def parse_assignments(pairs: list) -> tuple[dict, list]:
@@ -1941,7 +2707,75 @@ def build_parser() -> argparse.ArgumentParser:
     p_preset = sub.add_parser("preset", help="save, load, or clear a PTZ preset")
     p_preset.add_argument("action", choices=("save", "load", "clear"))
     p_preset.add_argument("slot", type=int, help="slot 1-3")
+    p_preset.add_argument("--local", action="store_true",
+                          help="do not mirror the slot into the camera's own presets")
     p_preset.set_defaults(fn=cmd_preset)
+
+    p_native = sub.add_parser(
+        "native-preset",
+        help="the camera's own PTZ preset slots, shared with the vendor app",
+    )
+    p_native.add_argument("action", choices=("save", "load", "clear", "list"))
+    p_native.add_argument("slot", type=int, nargs="?", help="slot 1-3")
+    p_native.set_defaults(fn=cmd_native_preset)
+
+    p_vendor = sub.add_parser(
+        "vendor", help="read every vendor feature in one call"
+    )
+    p_vendor.set_defaults(fn=cmd_vendor)
+
+    p_snapshot = sub.add_parser(
+        "snapshot", help="save a full-resolution still (needs the video stream)"
+    )
+    p_snapshot.add_argument("--output", default=None, metavar="PATH",
+                            help=f"where to write it (default: ~/Pictures/{SNAPSHOT_NAME})")
+    p_snapshot.add_argument("--width", type=int, metavar="N",
+                            help="capture width (default: the camera's largest)")
+    p_snapshot.add_argument("--height", type=int, metavar="N",
+                            help="capture height (default: the camera's largest)")
+    p_snapshot.add_argument("--warmup", type=int, default=4, metavar="N",
+                            help="frames to discard while exposure settles (default 4)")
+    p_snapshot.set_defaults(fn=cmd_snapshot, streams=True)
+
+    p_formats = sub.add_parser(
+        "formats", help="list capture formats, resolutions, and frame rates"
+    )
+    p_formats.set_defaults(fn=cmd_formats)
+
+    p_audio = sub.add_parser("audio", help="read or set the microphone DSP mode")
+    p_audio.add_argument("mode", nargs="?", choices=sorted(AUDIO_MODES),
+                         help="omit to read the current mode")
+    p_audio.set_defaults(fn=cmd_audio)
+
+    p_gesture = sub.add_parser("gesture", help="read or set gesture control")
+    p_gesture.add_argument("state", nargs="?", choices=("on", "off", "toggle"),
+                           help="omit to read the current state")
+    p_gesture.set_defaults(fn=cmd_gesture)
+
+    p_feature = sub.add_parser(
+        "feature", help="image orientation toggles: " + ", ".join(sorted(FEATURE_IDS))
+    )
+    p_feature.add_argument("name", nargs="?", choices=sorted(FEATURE_IDS),
+                           help="omit to read every toggle")
+    p_feature.add_argument("state", nargs="?", choices=("on", "off", "toggle"),
+                           help="omit to read just this toggle")
+    p_feature.set_defaults(fn=cmd_feature)
+
+    p_metering = sub.add_parser("metering", help="read or set what the autofocus aims at")
+    p_metering.add_argument("mode", nargs="?", choices=sorted(METERING_MODES),
+                            help="omit to read the current mode")
+    p_metering.add_argument("--x", type=int, metavar="N",
+                            help=f"area target x, 0-{METERING_MAX} from the left")
+    p_metering.add_argument("--y", type=int, metavar="N",
+                            help=f"area target y, 0-{METERING_MAX} from the top")
+    p_metering.set_defaults(fn=cmd_metering)
+
+    p_autoprivacy = sub.add_parser(
+        "auto-privacy", help="camera-side idle shutter timeout in seconds (0 disables)"
+    )
+    p_autoprivacy.add_argument("seconds", type=int, nargs="?",
+                               help="omit to read the current timeout")
+    p_autoprivacy.set_defaults(fn=cmd_autoprivacy)
 
     p_image = sub.add_parser("image", help="read or set image controls")
     p_image.add_argument("--set", action="append", metavar="KEY=VALUE",

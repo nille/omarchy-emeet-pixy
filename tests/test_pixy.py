@@ -24,7 +24,7 @@ import struct
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 
 HELPER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "pixy")
@@ -306,6 +306,377 @@ class ReadModeTests(unittest.TestCase):
                 pixy.read_mode("/dev/hidrawTEST", streaming=True),
                 pixy.read_mode("/dev/hidrawTEST", streaming=False),
             )
+
+
+# ---------------------------------------------------------------- vendor features
+
+
+def vendor_reply(payload, *values):
+    """A reply that echoes a request's group and command bytes, then values.
+
+    Built the way the camera actually answers — echoing bytes 1..3 — because
+    `query` matches on those, and a fake that omitted them would pass tests
+    against code that could never work on hardware.
+    """
+    head = list(payload[:4])
+    body = list(values)
+    return bytes(head + [0x00, len(body), 0x00, len(body)] + body)
+
+
+class VendorReportTests(unittest.TestCase):
+    """The set reports, checked byte for byte against the packet captures.
+
+    These are the bytes that reach the hardware, and a wrong one is either a
+    no-op or something undocumented — so each is pinned literally rather than
+    round-tripped through the same constants that built it.
+    """
+
+    def test_audio_modes_encode_their_captured_values(self):
+        self.assertEqual(
+            pixy.AUDIO_MODES, {"noise-cancel": 0x01, "live": 0x02, "original": 0x03}
+        )
+
+    def test_audio_names_round_trip(self):
+        for name, value in pixy.AUDIO_MODES.items():
+            self.assertEqual(pixy.AUDIO_NAMES[value], name)
+
+    def test_audio_report_matches_the_capture(self):
+        report = pixy.audio_report("live")[0]
+        self.assertEqual(
+            report[:9], bytes([0x09, 0x05, 0x00, 0x03, 0x00, 0x01, 0x00, 0x01, 0x02])
+        )
+
+    def test_gesture_report_matches_the_capture(self):
+        on = pixy.gesture_report(True)[0]
+        off = pixy.gesture_report(False)[0]
+        self.assertEqual(
+            on[:10], bytes([0x09, 0x04, 0x02, 0x00, 0x00, 0x02, 0x00, 0x02, 0x02, 0x01])
+        )
+        # Only the value byte differs, which is what makes this a toggle.
+        self.assertEqual(on[:9], off[:9])
+        self.assertEqual(off[9], 0x00)
+
+    def test_feature_ids_are_the_three_confirmed_toggles(self):
+        # Manual rotation is deliberately absent: the vendor app's rotate buttons
+        # produce no USB traffic, so rotation is a host-side transform and not a
+        # camera setting. A fourth id here would be an invented command.
+        self.assertEqual(
+            pixy.FEATURE_IDS,
+            {"flipHorizontal": 0x01, "flipVertical": 0x02, "autoRotate": 0x04},
+        )
+
+    def test_feature_report_addresses_the_right_feature(self):
+        for key, fid in pixy.FEATURE_IDS.items():
+            report = pixy.feature_report(key, True)[0]
+            self.assertEqual(
+                report[:10],
+                bytes([0x09, 0x04, 0x00, 0x08, 0x00, 0x02, 0x00, 0x02, fid, 0x01]),
+                key,
+            )
+
+    def test_metering_sends_a_staged_write_then_a_commit(self):
+        reports = pixy.metering_report("face")
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(reports[0][:4], bytes([0x09, 0x04, 0x00, 0x01]))
+        self.assertEqual(reports[1][:4], bytes([0x09, 0x04, 0x00, 0x03]))
+        # Both carry the same payload; the camera does not act on the first alone.
+        self.assertEqual(reports[0][4:13], reports[1][4:13])
+
+    def test_metering_area_carries_its_coordinates(self):
+        report = pixy.metering_report("area", 0x0F, 0x20)[0]
+        self.assertEqual(
+            report[:13],
+            bytes([0x09, 0x04, 0x00, 0x01, 0x00, 0x05, 0x00, 0x05,
+                   0x02, 0x0F, 0x20, 0x7F, 0x7F]),
+        )
+
+    def test_native_preset_save_sends_no_coordinates(self):
+        # The camera stores its own current position. Sending coordinates would
+        # mean inventing a payload the vendor app never sends.
+        report = pixy.native_preset_report(2, saved=True)[0]
+        self.assertEqual(
+            report[:10], bytes([0x09, 0x03, 0x01, 0x15, 0x00, 0x02, 0x00, 0x02, 2, 0x01])
+        )
+
+    def test_native_preset_clear_differs_only_in_the_enable_byte(self):
+        save = pixy.native_preset_report(3, saved=True)[0]
+        clear = pixy.native_preset_report(3, saved=False)[0]
+        self.assertEqual(save[:9], clear[:9])
+        self.assertEqual((save[9], clear[9]), (0x01, 0x00))
+
+    def test_autoprivacy_seconds_are_little_endian(self):
+        report = pixy.autoprivacy_report(300)[0]
+        self.assertEqual(report[:8], bytes([0x09, 0x02, 0x01, 0x00, 0x00, 0x04, 0x00, 0x04]))
+        self.assertEqual(report[8:12], (300).to_bytes(4, "little"))
+
+    def test_autoprivacy_zero_disables_rather_than_erroring(self):
+        report = pixy.autoprivacy_report(0)[0]
+        self.assertEqual(report[8:12], bytes(4))
+
+
+class QueryMatchingTests(unittest.TestCase):
+    """What `query` accepts as an answer, exercised through a fake hidraw fd.
+
+    Matching is the subtle part. A group holds several commands, so matching on
+    the group alone accepts one command's acknowledgement as another's answer —
+    which is how a working setter reported itself as failed.
+    """
+
+    def run_query(self, payload, replies):
+        """Drive query() against a scripted sequence of reads."""
+        pending = list(replies)
+
+        def fake_read(fd, size):
+            if not pending:
+                raise BlockingIOError
+            reply = pending.pop(0)
+            if reply is None:
+                raise BlockingIOError
+            return reply
+
+        with mock.patch.object(pixy.os, "open", return_value=7), \
+             mock.patch.object(pixy.os, "close"), \
+             mock.patch.object(pixy.os, "write"), \
+             mock.patch.object(pixy.os, "read", side_effect=fake_read), \
+             mock.patch.object(pixy, "drain"), \
+             mock.patch.object(pixy.select, "select",
+                               side_effect=lambda r, w, x, t: (list(r), [], [])), \
+             mock.patch.object(pixy.time, "sleep"):
+            return pixy.query("/dev/hidrawTEST", payload)
+
+    def test_accepts_a_reply_echoing_the_command(self):
+        payload = [0x09, 0x05, 0x00, 0x04]
+        reply = vendor_reply(payload, 0x02)
+        self.assertEqual(self.run_query(payload, [reply]), reply)
+
+    def test_rejects_an_acknowledgement_of_a_different_command_in_the_same_group(self):
+        # The bug this pins: `09 05 00 03` (set audio) acknowledges with 0x20 where
+        # the value belongs. Accepting it as the answer to `09 05 00 04` (read
+        # audio) decodes an ack byte as a mode and reports a good write as failed.
+        read_payload = [0x09, 0x05, 0x00, 0x04]
+        set_ack = vendor_reply([0x09, 0x05, 0x00, 0x03], pixy.ACK_BYTE)
+        answer = vendor_reply(read_payload, 0x02)
+        self.assertEqual(self.run_query(read_payload, [set_ack, answer]), answer)
+
+    def test_rejects_another_groups_report(self):
+        payload = [0x09, 0x05, 0x00, 0x04]
+        other = vendor_reply([0x09, 0x01, 0x01, 0x01], 0x02)
+        answer = vendor_reply(payload, 0x03)
+        self.assertEqual(self.run_query(payload, [other, answer]), answer)
+
+    def test_tolerates_high_bits_set_on_the_group_byte(self):
+        # The camera sets high bits on the group: 0x01 comes back as 0x41 or 0x61.
+        payload = [0x09, 0x01, 0x01, 0x01]
+        aliased = bytes([0x09, 0x41, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01, 0x02])
+        self.assertEqual(self.run_query(payload, [aliased]), aliased)
+
+    def test_a_reply_too_short_to_carry_a_command_is_rejected(self):
+        payload = [0x09, 0x05, 0x00, 0x04]
+        answer = vendor_reply(payload, 0x01)
+        self.assertEqual(self.run_query(payload, [bytes([0x09, 0x05]), answer]), answer)
+
+    def test_gives_up_rather_than_looping_forever(self):
+        # `select` reports nothing readable rather than being left real, so this
+        # asserts the retry budget without spending QUERY_ATTEMPTS timeouts of
+        # wall-clock in the suite.
+        with mock.patch.object(pixy.os, "open", return_value=7), \
+             mock.patch.object(pixy.os, "close"), \
+             mock.patch.object(pixy.os, "write"), \
+             mock.patch.object(pixy, "drain"), \
+             mock.patch.object(pixy.select, "select", return_value=([], [], [])), \
+             mock.patch.object(pixy.time, "sleep"):
+            self.assertIsNone(pixy.query("/dev/hidrawTEST", [0x09, 0x05, 0x00, 0x04]))
+
+    def test_an_unopenable_node_yields_no_reply(self):
+        with mock.patch.object(pixy.os, "open", side_effect=OSError(errno.EACCES, "denied")):
+            self.assertIsNone(pixy.query("/dev/hidrawTEST", [0x09, 0x05, 0x00, 0x04]))
+
+
+class HidSessionTests(unittest.TestCase):
+    def test_reuses_one_descriptor_across_queries(self):
+        # Why this exists: the first write to a fresh hidraw fd is lost, so a
+        # reopened fd pays a full query timeout every time. Reading ten features
+        # took 8.4s reopening and 0.56s sharing one fd.
+        opened = []
+
+        def fake_open(path, flags):
+            opened.append(path)
+            return 11
+
+        with mock.patch.object(pixy.os, "open", side_effect=fake_open), \
+             mock.patch.object(pixy.os, "close") as closer, \
+             mock.patch.object(pixy, "query", return_value=b"reply") as querier:
+            with pixy.HidSession("/dev/hidrawTEST") as session:
+                session.query([0x09, 0x05, 0x00, 0x04])
+                session.query([0x09, 0x04, 0x00, 0x02])
+                fd = session.fd
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(closer.call_count, 1)
+        # Both queries borrowed the session's descriptor rather than opening one.
+        for call in querier.call_args_list:
+            self.assertEqual(call.kwargs["fd"], fd)
+
+    def test_closes_the_descriptor_even_when_the_body_raises(self):
+        with mock.patch.object(pixy.os, "open", return_value=11), \
+             mock.patch.object(pixy.os, "close") as closer:
+            with self.assertRaises(ValueError):
+                with pixy.HidSession("/dev/hidrawTEST"):
+                    raise ValueError("boom")
+        self.assertEqual(closer.call_count, 1)
+
+    def test_a_borrowed_descriptor_is_not_closed_by_query(self):
+        # query() must not close a descriptor it did not open, or the session's
+        # second call would write to a closed fd.
+        with mock.patch.object(pixy.os, "close") as closer, \
+             mock.patch.object(pixy.os, "write"), \
+             mock.patch.object(pixy.os, "read", side_effect=BlockingIOError), \
+             mock.patch.object(pixy, "drain"), \
+             mock.patch.object(pixy.select, "select", return_value=([], [], [])), \
+             mock.patch.object(pixy.time, "sleep"):
+            pixy.query("/dev/hidrawTEST", [0x09, 0x05, 0x00, 0x04], fd=11)
+        closer.assert_not_called()
+
+
+class VendorReadTests(unittest.TestCase):
+    def test_audio_decodes_each_mode(self):
+        for value, name in pixy.AUDIO_NAMES.items():
+            reply = vendor_reply([0x09, 0x05, 0x00, 0x04], value)
+            with mock.patch.object(pixy, "query", return_value=reply):
+                self.assertEqual(pixy.read_audio("/dev/hidrawTEST"), (name, value))
+
+    def test_audio_keeps_an_unknown_raw_value(self):
+        reply = vendor_reply([0x09, 0x05, 0x00, 0x04], 0x7E)
+        with mock.patch.object(pixy, "query", return_value=reply):
+            self.assertEqual(pixy.read_audio("/dev/hidrawTEST"), (None, 0x7E))
+
+    def test_gesture_reads_byte_nine_not_the_last_byte(self):
+        # The regression this guards, seen in another Linux tool for this camera:
+        # reports are zero-padded to 32 bytes, so reading the value from the end
+        # always yields 0 — indistinguishable from "gesture is off".
+        reply = vendor_reply([0x09, 0x04, 0x02, 0x01], 0x02, 0x01)
+        padded = reply + bytes(pixy.REPORT_SIZE - len(reply))
+        with mock.patch.object(pixy, "query", return_value=padded):
+            self.assertTrue(pixy.read_gesture("/dev/hidrawTEST"))
+
+    def test_gesture_off_reads_false(self):
+        reply = vendor_reply([0x09, 0x04, 0x02, 0x01], 0x02, 0x00)
+        with mock.patch.object(pixy, "query", return_value=reply):
+            self.assertFalse(pixy.read_gesture("/dev/hidrawTEST"))
+
+    def test_gesture_distinguishes_off_from_unreadable(self):
+        # False and None mean different things to the panel: one is a state, the
+        # other is "the camera did not answer".
+        with mock.patch.object(pixy, "query", return_value=None):
+            self.assertIsNone(pixy.read_gesture("/dev/hidrawTEST"))
+
+    def test_feature_reads_its_value_byte(self):
+        for key, fid in pixy.FEATURE_IDS.items():
+            reply = vendor_reply([0x09, 0x04, 0x00, 0x07], fid, 0x01)
+            with mock.patch.object(pixy, "query", return_value=reply):
+                self.assertTrue(pixy.read_feature("/dev/hidrawTEST", key), key)
+
+    def test_feature_short_reply_is_not_decoded(self):
+        with mock.patch.object(pixy, "query", return_value=bytes([0x09, 0x04, 0x00, 0x07])):
+            self.assertIsNone(pixy.read_feature("/dev/hidrawTEST", "flipHorizontal"))
+
+    def test_metering_reports_mode_and_point(self):
+        reply = vendor_reply([0x09, 0x04, 0x00, 0x02], 0x02, 0x38, 0x38, 0x7F, 0x7F)
+        with mock.patch.object(pixy, "query", return_value=reply):
+            result = pixy.read_metering("/dev/hidrawTEST")
+        self.assertEqual(result, {"mode": "area", "raw": 0x02, "x": 0x38, "y": 0x38})
+
+    def test_metering_keeps_stale_coordinates_visible_in_other_modes(self):
+        # The camera does not clear the last picked point when leaving area mode.
+        # Reporting the bytes anyway is honest; hiding them would imply a reset
+        # that never happened.
+        reply = vendor_reply([0x09, 0x04, 0x00, 0x02], 0x00, 0x38, 0x38, 0x7F, 0x7F)
+        with mock.patch.object(pixy, "query", return_value=reply):
+            result = pixy.read_metering("/dev/hidrawTEST")
+        self.assertEqual(result["mode"], "center")
+        self.assertEqual((result["x"], result["y"]), (0x38, 0x38))
+
+    def test_native_preset_decodes_degrees_matching_the_uvc_space(self):
+        # Measured on hardware: saving at UVC pan=-35.0 stores -34.969. The slots
+        # are in degrees, not some private HID unit, which is what makes loading
+        # them over UVC correct.
+        floats = struct.pack("<fff", -34.969, 10.022, 0.0)
+        reply = bytes([0x09, 0x03, 0x01, 0x16, 0x00, 0x0E, 0x00, 0x0E, 0x01, 0x01]) + floats
+        with mock.patch.object(pixy, "query", return_value=reply):
+            entry = pixy.read_native_preset("/dev/hidrawTEST", 1)
+        self.assertTrue(entry["saved"])
+        self.assertAlmostEqual(entry["pan"], -34.969, places=3)
+        self.assertAlmostEqual(entry["tilt"], 10.022, places=3)
+
+    def test_native_preset_empty_slot_reads_unsaved(self):
+        reply = bytes([0x09, 0x03, 0x01, 0x16, 0x00, 0x0E, 0x00, 0x0E, 0x02, 0x00]) + bytes(12)
+        with mock.patch.object(pixy, "query", return_value=reply):
+            entry = pixy.read_native_preset("/dev/hidrawTEST", 2)
+        self.assertFalse(entry["saved"])
+
+    def test_native_preset_short_reply_is_not_decoded(self):
+        # A truncated reply would unpack neighbouring bytes as floats and report a
+        # confident, wrong position.
+        with mock.patch.object(pixy, "query", return_value=bytes(16)):
+            self.assertIsNone(pixy.read_native_preset("/dev/hidrawTEST", 1))
+
+    def test_autoprivacy_decodes_little_endian_seconds(self):
+        reply = bytes([0x09, 0x02, 0x01, 0x01, 0x00, 0x04, 0x00, 0x04]) + (300).to_bytes(4, "little")
+        with mock.patch.object(pixy, "query", return_value=reply):
+            self.assertEqual(pixy.read_autoprivacy("/dev/hidrawTEST"), 300)
+
+    def test_autoprivacy_zero_is_a_value_not_an_absence(self):
+        reply = bytes([0x09, 0x02, 0x01, 0x01, 0x00, 0x04, 0x00, 0x04]) + bytes(4)
+        with mock.patch.object(pixy, "query", return_value=reply):
+            self.assertEqual(pixy.read_autoprivacy("/dev/hidrawTEST"), 0)
+
+
+class SetAndConfirmTests(unittest.TestCase):
+    """Setters confirm by reading back, and retry a write the camera dropped."""
+
+    def test_a_confirmed_write_stops_after_one_attempt(self):
+        with mock.patch.object(pixy, "write_reports") as writer, \
+             mock.patch.object(pixy.time, "sleep"):
+            result = pixy.set_and_confirm(
+                "/dev/hidrawTEST", [b"x"], lambda path: "live", "live"
+            )
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(writer.call_count, 1)
+
+    def test_a_dropped_first_write_is_retried(self):
+        # The measured quirk: the first write after an idle period is ignored, and
+        # the identical command succeeds immediately afterwards.
+        answers = iter(["noise-cancel", "live"])
+        with mock.patch.object(pixy, "write_reports") as writer, \
+             mock.patch.object(pixy.time, "sleep"):
+            result = pixy.set_and_confirm(
+                "/dev/hidrawTEST", [b"x"], lambda path: next(answers), "live"
+            )
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(writer.call_count, 2)
+
+    def test_a_write_the_camera_refuses_reports_unconfirmed_not_failed(self):
+        # ok=true with confirmed=false: the command was sent and the camera
+        # declined it. That is a real outcome the panel should show, not an error.
+        with mock.patch.object(pixy, "write_reports"), \
+             mock.patch.object(pixy.time, "sleep"):
+            result = pixy.set_and_confirm(
+                "/dev/hidrawTEST", [b"x"], lambda path: "noise-cancel", "live"
+            )
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["confirmed"])
+        self.assertEqual(result["actual"], "noise-cancel")
+        self.assertEqual(result["attempts"], pixy.SET_ATTEMPTS)
+
+    def test_an_unreadable_readback_is_not_mistaken_for_success(self):
+        with mock.patch.object(pixy, "write_reports"), \
+             mock.patch.object(pixy.time, "sleep"):
+            result = pixy.set_and_confirm(
+                "/dev/hidrawTEST", [b"x"], lambda path: None, "live"
+            )
+        self.assertFalse(result["confirmed"])
+        self.assertIsNone(result["actual"])
 
 
 # ---------------------------------------------------------------- discovery
@@ -1312,6 +1683,13 @@ class CommandContractTests(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"XDG_STATE_HOME": self.tmp.name})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # No vendor node unless a test asks for one. `preset save` mirrors into the
+        # camera's own slots, so without this the suite would reach a real hidraw
+        # on a developer machine and write to the hardware. Tests that want the
+        # mirror patch this themselves.
+        absent = mock.patch.object(pixy, "find_hidraw", return_value=None)
+        absent.start()
+        self.addCleanup(absent.stop)
 
     def assert_json(self, result):
         self.assertIsInstance(result, dict)
@@ -1734,6 +2112,88 @@ class CommandContractTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(pixy.read_presets(), {})
 
+    def mirroring(self, device=None):
+        """Patch in a camera whose vendor slots a `preset` call will mirror into."""
+        self.device = device if device is not None else FakeVendorDevice()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(pixy, "find_hidraw",
+                                              return_value="/dev/hidrawTEST"))
+        stack.enter_context(mock.patch.object(pixy, "query", side_effect=self.device.query))
+        stack.enter_context(mock.patch.object(pixy, "write_reports",
+                                             side_effect=self.device.write_reports))
+        stack.enter_context(mock.patch.object(pixy.time, "sleep"))
+        return self.device
+
+    def ptz_camera(self, pan=45, tilt=-20, zoom=140):
+        cam = FakeCamera(
+            values={pixy.CID_PAN_ABSOLUTE: pan * 3600,
+                    pixy.CID_TILT_ABSOLUTE: tilt * 3600,
+                    pixy.CID_ZOOM_ABSOLUTE: zoom},
+            specs=ptz_specs(),
+        )
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(pixy, "find_video", return_value="/dev/videoTEST"))
+        stack.enter_context(mock.patch.object(pixy, "Camera", return_value=cam))
+        return cam
+
+    def test_preset_save_mirrors_into_the_cameras_own_slot(self):
+        # So a preset made here shows up in EMEET Studio and survives a reboot.
+        device = self.mirroring()
+        device.pan, device.tilt = 45.0, -20.0
+        self.ptz_camera()
+        result = self.assert_json(pixy.cmd_preset(args_for(["preset", "save", "2"])))
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["native"]["confirmed"])
+        self.assertTrue(device.presets[2][0])
+
+    def test_preset_clear_erases_the_cameras_slot_too(self):
+        device = self.mirroring(FakeVendorDevice(
+            presets={1: (True, 45.0, -20.0), 2: (False, 0.0, 0.0), 3: (False, 0.0, 0.0)}
+        ))
+        pixy.write_presets({1: {"pan": 45, "tilt": -20, "zoom": 140}})
+        result = self.assert_json(pixy.cmd_preset(args_for(["preset", "clear", "1"])))
+        self.assertTrue(result["ok"])
+        self.assertFalse(device.presets[1][0])
+
+    def test_a_mirror_that_fails_does_not_lose_the_local_preset(self):
+        # The local store is the authority — it is the only one that holds zoom —
+        # so a camera that ignores the vendor write must not fail the save.
+        self.mirroring(FakeVendorDevice(deaf={(0x03, 0x01, 0x16)}))
+        self.ptz_camera()
+        result = self.assert_json(pixy.cmd_preset(args_for(["preset", "save", "1"])))
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["native"]["confirmed"])
+        self.assertEqual(pixy.read_presets()[1], {"pan": 45, "tilt": -20, "zoom": 140})
+
+    def test_a_camera_without_a_vendor_node_still_saves_locally(self):
+        # The ordinary state of a camera whose udev rule is not installed.
+        self.ptz_camera()
+        result = self.assert_json(pixy.cmd_preset(args_for(["preset", "save", "1"])))
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["native"])
+        self.assertIn(1, pixy.read_presets())
+
+    def test_local_skips_the_mirror_entirely(self):
+        device = self.mirroring()
+        self.ptz_camera()
+        result = self.assert_json(pixy.cmd_preset(args_for(["preset", "save", "1", "--local"])))
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["native"])
+        self.assertEqual(device.writes, [])
+
+    def test_preset_load_does_not_touch_the_cameras_slots(self):
+        # Load drives UVC from the local triple, which is the only copy that has
+        # the zoom. Reading or writing a vendor slot here would be pure cost.
+        device = self.mirroring()
+        pixy.write_presets({1: {"pan": 10, "tilt": 5, "zoom": 120}})
+        self.ptz_camera(pan=0, tilt=0, zoom=100)
+        result = self.assert_json(pixy.cmd_preset(args_for(["preset", "load", "1"])))
+        self.assertTrue(result["ok"])
+        self.assertEqual(device.writes, [])
+        self.assertEqual(device.reads, [])
+
     def test_preset_views_key_slots_as_strings_for_json(self):
         # JSON object keys are strings; the panel indexes presets by slot, so a
         # numeric key here would silently miss every lookup.
@@ -1748,6 +2208,539 @@ class CommandContractTests(unittest.TestCase):
             result = self.assert_json(pixy.cmd_info(args_for(["info"])))
         self.assertFalse(result["present"])
         self.assertEqual(result["error"], "no-camera")
+
+
+class FakeVendorDevice:
+    """A camera that answers vendor HID queries from in-memory state.
+
+    Routed on bytes 1..3 of the payload, which is what identifies a command on
+    this protocol, and it answers reads from whatever the writes left behind — so
+    a setter that builds the wrong report or reads the wrong offset fails here the
+    way it would on hardware, rather than passing against a canned reply.
+
+    `deaf` names commands to answer with silence, and `stubborn` names ones to
+    ignore the first write to, which is the camera's real behaviour after an idle
+    period.
+    """
+
+    def __init__(self, audio=0x01, gesture=True, features=None, metering=(0x00, 56, 56),
+                 autoprivacy=0, presets=None, deaf=(), stubborn=()):
+        self.audio = audio
+        self.gesture = gesture
+        self.features = dict(features or {0x01: False, 0x02: False, 0x04: True})
+        self.metering = metering
+        self.autoprivacy = autoprivacy
+        # slot -> (saved, pan, tilt)
+        self.presets = dict(presets or {1: (False, 0.0, 0.0), 2: (False, 0.0, 0.0),
+                                        3: (False, 0.0, 0.0)})
+        self.deaf = set(deaf)
+        self.stubborn = set(stubborn)
+        self.writes = []
+        self.reads = []
+
+    @staticmethod
+    def key(report):
+        return tuple(report[1:4])
+
+    def write_reports(self, path, reports):
+        for report in reports:
+            key = self.key(report)
+            self.writes.append(key)
+            if key in self.stubborn:
+                self.stubborn.discard(key)
+                continue
+            if key == (0x05, 0x00, 0x03):
+                self.audio = report[8]
+            elif key == (0x04, 0x02, 0x00):
+                self.gesture = bool(report[9])
+            elif key == (0x04, 0x00, 0x08):
+                self.features[report[8]] = bool(report[9])
+            elif key == (0x04, 0x00, 0x03):  # the commit; 0x01 only stages
+                # The camera keeps the last picked point when the mode carries
+                # none, rather than taking the zeros the report sends.
+                x, y = (report[9], report[10]) if report[8] == 0x02 else self.metering[1:]
+                self.metering = (report[8], x, y)
+            elif key == (0x03, 0x01, 0x15):
+                slot, saved = report[8], bool(report[9])
+                previous = self.presets.get(slot, (False, 0.0, 0.0))
+                self.presets[slot] = ((True, self.pan, self.tilt) if saved
+                                      else (False, previous[1], previous[2]))
+            elif key == (0x02, 0x01, 0x00):
+                self.autoprivacy = int.from_bytes(report[8:12], "little")
+
+    # Where the lens is, for a save to capture.
+    pan = 0.0
+    tilt = 0.0
+
+    def query(self, path, payload, fd=None):
+        report = pixy.build_report(payload)
+        key = self.key(report)
+        self.reads.append(key)
+        if key in self.deaf:
+            return None
+        if key == (0x05, 0x00, 0x04):
+            return vendor_reply(payload, self.audio)
+        if key == (0x04, 0x02, 0x01):
+            return vendor_reply(payload, 0x02, int(self.gesture))
+        if key == (0x04, 0x00, 0x07):
+            return vendor_reply(payload, report[8], int(self.features.get(report[8], False)))
+        if key == (0x04, 0x00, 0x02):
+            return vendor_reply(payload, *self.metering)
+        if key == (0x03, 0x01, 0x16):
+            saved, pan, tilt = self.presets.get(report[8], (False, 0.0, 0.0))
+            return vendor_reply(payload, report[8], int(saved),
+                                *struct.pack("<fff", pan, tilt, 0.0))
+        if key == (0x02, 0x01, 0x01):
+            return vendor_reply(payload, *self.autoprivacy.to_bytes(4, "little"))
+        return None
+
+
+class VendorCommandTests(unittest.TestCase):
+    """The vendor-feature commands as the panel calls them."""
+
+    def fake_open(self, path, flags):
+        self.opened.append(path)
+        return 13
+
+    def run_cmd(self, argv, device=None, hid="/dev/hidrawTEST", cam=None,
+                node="/dev/videoTEST"):
+        self.device = device if device is not None else FakeVendorDevice()
+        self.opened = []
+        self.cam = cam
+        stack = [
+            mock.patch.object(pixy, "find_hidraw", return_value=hid),
+            mock.patch.object(pixy, "query", side_effect=self.device.query),
+            mock.patch.object(pixy, "write_reports", side_effect=self.device.write_reports),
+            # SET_SETTLE is real hardware latency, and paying it per setter would
+            # cost seconds across this suite.
+            mock.patch.object(pixy.time, "sleep"),
+            mock.patch.object(pixy.os, "open", side_effect=self.fake_open),
+            mock.patch.object(pixy.os, "close"),
+            mock.patch.object(pixy, "find_video", return_value=node),
+        ]
+        if cam is not None:
+            stack.append(mock.patch.object(pixy, "Camera", return_value=cam))
+        with ExitStack() as entered:
+            for patcher in stack:
+                entered.enter_context(patcher)
+            result = pixy.build_parser().parse_args(argv).fn(args_for(argv))
+        self.assertIsInstance(result, dict)
+        json.dumps(result)  # the panel parses stdout unconditionally
+        return result
+
+    def assert_absent(self, argv):
+        """Every vendor command must survive a camera with no writable hidraw."""
+        with mock.patch.object(pixy, "find_hidraw", return_value=None):
+            result = pixy.build_parser().parse_args(argv).fn(args_for(argv))
+        self.assertIsInstance(result, dict)
+        json.dumps(result)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["present"])
+        return result
+
+    def test_every_vendor_command_survives_a_missing_hid_node(self):
+        for argv in (["audio"], ["audio", "live"], ["gesture"], ["gesture", "on"],
+                     ["feature"], ["feature", "flipHorizontal", "on"], ["metering"],
+                     ["metering", "face"], ["auto-privacy"], ["auto-privacy", "60"],
+                     ["vendor"], ["native-preset", "list"], ["native-preset", "save", "1"]):
+            with self.subTest(argv=argv):
+                self.assert_absent(argv)
+
+    def test_vendor_reads_every_feature_in_one_call(self):
+        result = self.run_cmd(["vendor"], FakeVendorDevice(
+            audio=0x02, gesture=True, autoprivacy=300,
+            presets={1: (True, 9.4, -15.9), 2: (False, 0.0, 0.0), 3: (False, 0.0, 0.0)},
+        ))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["audio"], "live")
+        self.assertTrue(result["gesture"])
+        self.assertEqual(result["autoPrivacy"], 300)
+        self.assertEqual(set(result["features"]), set(pixy.FEATURE_IDS))
+        self.assertEqual(result["metering"]["mode"], "center")
+        self.assertTrue(result["nativePresets"]["1"]["saved"])
+        self.assertFalse(result["nativePresets"]["2"]["saved"])
+
+    def test_vendor_shares_one_descriptor_for_all_of_it(self):
+        # Ten features, one open. Reopening per query costs a full query timeout
+        # each, because the first write to a fresh descriptor is dropped.
+        self.run_cmd(["vendor"])
+        self.assertEqual(self.opened, ["/dev/hidrawTEST"])
+
+    def test_vendor_reports_a_silent_feature_as_null_not_missing(self):
+        # The panel distinguishes "off" from "could not read", so a feature the
+        # camera ignores has to be present and null rather than absent.
+        result = self.run_cmd(["vendor"], FakeVendorDevice(
+            deaf={(0x04, 0x02, 0x01), (0x02, 0x01, 0x01)}
+        ))
+        self.assertTrue(result["ok"])
+        self.assertIn("gesture", result)
+        self.assertIsNone(result["gesture"])
+        self.assertIsNone(result["autoPrivacy"])
+
+    def test_audio_read_names_the_mode(self):
+        result = self.run_cmd(["audio"], FakeVendorDevice(audio=0x03))
+        self.assertEqual(result["audio"], "original")
+
+    def test_audio_set_confirms_from_the_readback(self):
+        result = self.run_cmd(["audio", "live"], FakeVendorDevice(audio=0x01))
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["audio"], "live")
+        self.assertEqual(self.device.audio, 0x02)
+
+    def test_audio_set_retries_the_dropped_cold_write(self):
+        result = self.run_cmd(["audio", "live"],
+                              FakeVendorDevice(audio=0x01, stubborn={(0x05, 0x00, 0x03)}))
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["attempts"], 2)
+
+    def test_gesture_toggle_flips_the_live_value(self):
+        result = self.run_cmd(["gesture", "toggle"], FakeVendorDevice(gesture=True))
+        self.assertFalse(result["gesture"])
+        self.assertFalse(self.device.gesture)
+
+    def test_gesture_toggle_without_a_readable_state_refuses(self):
+        # Toggling from an unknown state would be a coin flip on a privacy-adjacent
+        # feature, so it errors instead of guessing.
+        result = self.run_cmd(["gesture", "toggle"],
+                              FakeVendorDevice(deaf={(0x04, 0x02, 0x01)}))
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.device.writes, [])
+
+    def test_feature_read_with_no_name_reports_all_three(self):
+        result = self.run_cmd(["feature"])
+        self.assertEqual(set(result["features"]), set(pixy.FEATURE_IDS))
+
+    def test_feature_set_touches_only_the_named_toggle(self):
+        result = self.run_cmd(["feature", "flipVertical", "on"])
+        self.assertEqual(result["feature"], "flipVertical")
+        self.assertTrue(result["value"])
+        self.assertTrue(self.device.features[pixy.FEATURE_IDS["flipVertical"]])
+        self.assertFalse(self.device.features[pixy.FEATURE_IDS["flipHorizontal"]])
+
+    def test_metering_area_needs_a_point(self):
+        result = self.run_cmd(["metering", "area"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.device.writes, [])
+
+    def test_metering_area_rejects_an_out_of_range_point(self):
+        result = self.run_cmd(["metering", "area", "--x", "200", "--y", "10"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.device.writes, [])
+
+    def test_metering_area_stores_the_point(self):
+        result = self.run_cmd(["metering", "area", "--x", "20", "--y", "90"])
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["metering"], {"mode": "area", "raw": 0x02, "x": 20, "y": 90})
+
+    def test_metering_stages_then_commits(self):
+        self.run_cmd(["metering", "face"])
+        self.assertEqual(self.device.writes[:2], [(0x04, 0x00, 0x01), (0x04, 0x00, 0x03)])
+
+    def test_metering_reports_the_stale_point_it_cannot_clear(self):
+        # Leaving `area` does not reset x/y in the camera; reporting the stale
+        # numbers is honest, and pretending they were cleared would not be.
+        result = self.run_cmd(["metering", "center"],
+                              FakeVendorDevice(metering=(0x02, 20, 90)))
+        self.assertEqual(result["metering"]["mode"], "center")
+        self.assertEqual((result["metering"]["x"], result["metering"]["y"]), (20, 90))
+
+    def test_auto_privacy_round_trips_a_timeout(self):
+        result = self.run_cmd(["auto-privacy", "600"])
+        self.assertEqual(result["autoPrivacy"], 600)
+        self.assertEqual(self.device.autoprivacy, 600)
+
+    def test_auto_privacy_zero_disables_rather_than_reading(self):
+        result = self.run_cmd(["auto-privacy", "0"], FakeVendorDevice(autoprivacy=300))
+        self.assertEqual(result["autoPrivacy"], 0)
+        self.assertEqual(self.device.autoprivacy, 0)
+
+    def test_auto_privacy_rejects_a_negative_timeout(self):
+        result = self.run_cmd(["auto-privacy", "-1"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.device.writes, [])
+
+    def test_native_preset_list_needs_no_slot(self):
+        result = self.run_cmd(["native-preset", "list"], FakeVendorDevice(
+            presets={1: (True, 9.4, -15.9), 2: (False, 0.0, 0.0), 3: (False, 0.0, 0.0)}
+        ))
+        self.assertEqual(set(result["nativePresets"]), {"1", "2", "3"})
+        self.assertAlmostEqual(result["nativePresets"]["1"]["pan"], 9.4, places=3)
+
+    def test_native_preset_rejects_an_out_of_range_slot(self):
+        result = self.run_cmd(["native-preset", "save", "4"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.device.writes, [])
+
+    def test_native_preset_save_stores_where_the_lens_is(self):
+        device = FakeVendorDevice()
+        device.pan, device.tilt = 12.5, -3.25
+        result = self.run_cmd(["native-preset", "save", "2"], device)
+        self.assertTrue(result["confirmed"])
+        self.assertTrue(result["entry"]["saved"])
+        self.assertAlmostEqual(result["entry"]["pan"], 12.5, places=3)
+
+    def test_native_preset_clear_empties_only_that_slot(self):
+        result = self.run_cmd(["native-preset", "clear", "1"], FakeVendorDevice(
+            presets={1: (True, 9.4, -15.9), 2: (True, 1.0, 2.0), 3: (False, 0.0, 0.0)}
+        ))
+        self.assertFalse(result["entry"]["saved"])
+        self.assertTrue(result["nativePresets"]["2"]["saved"])
+
+    def test_native_preset_load_drives_the_lens_over_uvc(self):
+        # The vendor load command acknowledges and does not move the lens, so load
+        # reads the stored degrees over HID and writes them as UVC pan/tilt. A
+        # regression to HID motion would show up here as an unwritten camera.
+        cam = FakeCamera(specs=ptz_specs())
+        result = self.run_cmd(
+            ["native-preset", "load", "1"],
+            FakeVendorDevice(presets={1: (True, 10.0, -5.0), 2: (False, 0.0, 0.0),
+                                      3: (False, 0.0, 0.0)}),
+            cam=cam,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(cam.values[pixy.CID_PAN_ABSOLUTE], 10 * pixy.ARCSEC_PER_DEGREE)
+        self.assertEqual(cam.values[pixy.CID_TILT_ABSOLUTE], -5 * pixy.ARCSEC_PER_DEGREE)
+        # No HID write at all: the slot was only read.
+        self.assertEqual(self.device.writes, [])
+        self.assertEqual(result["pan"], 10)
+
+    def test_native_preset_load_of_an_empty_slot_says_empty(self):
+        result = self.run_cmd(["native-preset", "load", "3"], cam=FakeCamera(specs=ptz_specs()))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "empty")
+
+    def test_native_preset_load_of_an_unreadable_slot_is_not_called_empty(self):
+        # "Empty" and "the camera did not answer" lead to different fixes, so they
+        # must not collapse into the same message.
+        result = self.run_cmd(["native-preset", "load", "1"],
+                              FakeVendorDevice(deaf={(0x03, 0x01, 0x16)}),
+                              cam=FakeCamera(specs=ptz_specs()))
+        self.assertFalse(result["ok"])
+        self.assertNotEqual(result["error"], "empty")
+
+
+class FormatsCommandTests(unittest.TestCase):
+    """`formats`, which is read-only on purpose."""
+
+    def run_cmd(self, formats, node="/dev/videoTEST"):
+        cam = FakeCamera()
+        with mock.patch.object(pixy, "find_video", return_value=node), \
+             mock.patch.object(pixy, "Camera", return_value=cam), \
+             mock.patch.object(pixy, "enumerate_formats", return_value=formats):
+            result = pixy.cmd_formats(args_for(["formats"]))
+        self.cam = cam
+        self.assertIsInstance(result, dict)
+        json.dumps(result)
+        return result
+
+    FAKE = [{"fourcc": "MJPG", "pixelFormat": 1196444237, "description": "Motion-JPEG",
+             "compressed": True,
+             "sizes": [{"width": 3840, "height": 2160, "fps": [30.0]}]}]
+
+    def test_lists_what_the_camera_advertises(self):
+        result = self.run_cmd(self.FAKE)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["formats"], self.FAKE)
+
+    def test_reports_the_format_the_preview_itself_uses(self):
+        # The panel shows this next to the list so the preview's modest 640x480
+        # YUYV does not read as the camera's ceiling.
+        result = self.run_cmd(self.FAKE)
+        self.assertEqual(result["capture"]["fourcc"], "YUYV")
+        self.assertEqual(result["capture"]["width"], pixy.CAPTURE_WIDTH)
+
+    def test_writes_nothing_to_the_camera(self):
+        self.run_cmd(self.FAKE)
+        self.assertEqual(self.cam.writes, [])
+
+    def test_a_camera_that_advertises_nothing_is_not_ok(self):
+        result = self.run_cmd([])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["formats"], [])
+
+    def test_without_a_camera_reports_absence_as_data(self):
+        with mock.patch.object(pixy, "find_video", return_value=None):
+            result = pixy.cmd_formats(args_for(["formats"]))
+        json.dumps(result)
+        self.assertFalse(result["present"])
+
+
+class SnapshotPathTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_the_first_snapshot_keeps_the_name_it_was_given(self):
+        path = pixy.snapshot_path(os.path.join(self.tmp.name, "shot.jpg"))
+        self.assertEqual(path, os.path.join(self.tmp.name, "shot.jpg"))
+
+    def test_an_existing_file_is_not_clobbered(self):
+        first = pixy.snapshot_path(os.path.join(self.tmp.name, "shot.jpg"))
+        pathlib.Path(first).write_bytes(b"x")
+        second = pixy.snapshot_path(os.path.join(self.tmp.name, "shot.jpg"))
+        self.assertEqual(second, os.path.join(self.tmp.name, "shot-1.jpg"))
+
+    def test_the_counter_keeps_the_extension_last(self):
+        for index in range(3):
+            pathlib.Path(pixy.snapshot_path(
+                os.path.join(self.tmp.name, "shot.jpg"))).write_bytes(b"x")
+        self.assertEqual(
+            pixy.snapshot_path(os.path.join(self.tmp.name, "shot.jpg")),
+            os.path.join(self.tmp.name, "shot-3.jpg"),
+        )
+
+    def test_creates_the_directory_it_writes_into(self):
+        nested = os.path.join(self.tmp.name, "a", "b", "shot.jpg")
+        self.assertEqual(pixy.snapshot_path(nested), nested)
+        self.assertTrue(os.path.isdir(os.path.dirname(nested)))
+
+    def test_expands_a_tilde_and_an_environment_variable(self):
+        with mock.patch.dict(os.environ, {"HOME": self.tmp.name, "SHOTDIR": self.tmp.name}):
+            self.assertEqual(pixy.snapshot_path("~/shot.jpg"),
+                             os.path.join(self.tmp.name, "shot.jpg"))
+            self.assertEqual(pixy.snapshot_path("$SHOTDIR/other.jpg"),
+                             os.path.join(self.tmp.name, "other.jpg"))
+
+    def test_the_default_follows_the_pictures_directory(self):
+        with mock.patch.dict(os.environ, {"XDG_PICTURES_DIR": "/tmp/shots"}):
+            self.assertEqual(pixy.snapshot_default(), "/tmp/shots/" + pixy.SNAPSHOT_NAME)
+
+    def test_the_default_falls_back_to_pictures_under_home(self):
+        # `${VAR:-default}` is shell syntax that expandvars does not understand, so
+        # an unset XDG_PICTURES_DIR once expanded to a path starting with the
+        # literal fallback text.
+        env = {k: v for k, v in os.environ.items() if k != "XDG_PICTURES_DIR"}
+        env["HOME"] = "/home/someone"
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(pixy.snapshot_default(),
+                             "/home/someone/Pictures/" + pixy.SNAPSHOT_NAME)
+
+
+class SnapshotCommandTests(unittest.TestCase):
+    """`snapshot`, which writes the MJPEG frame to disk verbatim."""
+
+    JPEG = b"\xff\xd8\xff\xe0" + b"payload" * 8
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def fake_capture(self, frames=None, error=None, size=(3840, 2160)):
+        """A Capture that hands back canned frames without touching a device."""
+        captured = list(frames if frames is not None else [self.JPEG] * 8)
+        outer = self
+
+        class Cap:
+            def __init__(self, node, width, height, pixel_format=pixy.PIXFMT_YUYV):
+                outer.requested = (width, height, pixel_format)
+                self.width, self.height = size
+
+            def __enter__(self):
+                if error:
+                    raise error
+                return self
+
+            def __exit__(self, *exc):
+                outer.released = True
+
+            def frame(self):
+                outer.frames_taken = getattr(outer, "frames_taken", 0) + 1
+                return captured.pop(0)
+
+        return Cap
+
+    def run_cmd(self, argv, capture=None, formats=None, node="/dev/videoTEST"):
+        formats = formats if formats is not None else [
+            {"fourcc": "MJPG", "sizes": [{"width": 3840, "height": 2160, "fps": [30.0]}]},
+            {"fourcc": "YUYV", "sizes": [{"width": 640, "height": 480, "fps": [30.0]}]},
+        ]
+        with mock.patch.object(pixy, "find_video", return_value=node), \
+             mock.patch.object(pixy, "Camera", return_value=FakeCamera()), \
+             mock.patch.object(pixy, "enumerate_formats", return_value=formats), \
+             mock.patch.object(pixy, "Capture", capture or self.fake_capture()):
+            result = pixy.build_parser().parse_args(argv).fn(args_for(argv))
+        self.assertIsInstance(result, dict)
+        json.dumps(result)
+        return result
+
+    def out(self, name="shot.jpg"):
+        return os.path.join(self.tmp.name, name)
+
+    def test_writes_the_frame_to_disk_byte_for_byte(self):
+        # No encoder is involved: an MJPEG frame off this camera is already a
+        # complete JPEG file, and re-encoding it would be lossy for no reason.
+        result = self.run_cmd(["snapshot", "--output", self.out()])
+        self.assertTrue(result["ok"])
+        self.assertEqual(pathlib.Path(result["path"]).read_bytes(), self.JPEG)
+        self.assertEqual(result["bytes"], len(self.JPEG))
+        self.assertEqual(result["format"], "MJPG")
+
+    def test_defaults_to_the_largest_mjpeg_size(self):
+        self.run_cmd(["snapshot", "--output", self.out()])
+        self.assertEqual(self.requested, (3840, 2160, pixy.fourcc("MJPG")))
+
+    def test_an_explicit_size_is_used_without_asking_the_camera(self):
+        self.run_cmd(["snapshot", "--output", self.out(),
+                      "--width", "1280", "--height", "720"])
+        self.assertEqual(self.requested, (1280, 720, pixy.fourcc("MJPG")))
+
+    def test_reports_the_size_the_driver_actually_gave(self):
+        # The driver may substitute a size it prefers; reporting the request would
+        # claim a 4K still that is not one.
+        result = self.run_cmd(["snapshot", "--output", self.out(),
+                               "--width", "4000", "--height", "3000"],
+                              capture=self.fake_capture(size=(3840, 2160)))
+        self.assertEqual((result["width"], result["height"]), (3840, 2160))
+
+    def test_warmup_frames_are_discarded_before_the_one_that_is_kept(self):
+        frames = [b"\xff\xd8warm"] * 4 + [self.JPEG]
+        result = self.run_cmd(["snapshot", "--output", self.out(), "--warmup", "4"],
+                              capture=self.fake_capture(frames=frames))
+        self.assertEqual(self.frames_taken, 5)
+        self.assertEqual(pathlib.Path(result["path"]).read_bytes(), self.JPEG)
+
+    def test_no_warmup_keeps_the_very_first_frame(self):
+        result = self.run_cmd(["snapshot", "--output", self.out(), "--warmup", "0"])
+        self.assertEqual(self.frames_taken, 1)
+        self.assertTrue(result["ok"])
+
+    def test_a_non_jpeg_frame_is_refused_rather_than_written(self):
+        # A .jpg holding something else is worse than no file: nothing can open it
+        # and the failure surfaces long after the snapshot.
+        result = self.run_cmd(["snapshot", "--output", self.out()],
+                              capture=self.fake_capture(frames=[b"\x00" * 16] * 8))
+        self.assertFalse(result["ok"])
+        self.assertFalse(os.path.exists(self.out()))
+
+    def test_a_busy_stream_is_named_as_busy(self):
+        result = self.run_cmd(["snapshot", "--output", self.out()],
+                              capture=self.fake_capture(error=OSError(errno.EBUSY, "busy")))
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["busy"])
+
+    def test_another_oserror_is_not_reported_as_busy(self):
+        result = self.run_cmd(["snapshot", "--output", self.out()],
+                              capture=self.fake_capture(error=OSError(errno.ENODEV, "gone")))
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["busy"])
+
+    def test_a_camera_with_no_mjpeg_size_is_reported_not_guessed(self):
+        result = self.run_cmd(["snapshot", "--output", self.out()],
+                              formats=[{"fourcc": "YUYV", "sizes": []}])
+        self.assertFalse(result["ok"])
+        self.assertIn("MJPEG", result["error"])
+
+    def test_an_unwritable_destination_is_reported_with_its_path(self):
+        with mock.patch.object(pixy, "snapshot_path",
+                               side_effect=OSError(errno.EACCES, "denied")):
+            result = self.run_cmd(["snapshot", "--output", "/nowhere/shot.jpg"])
+        self.assertFalse(result["ok"])
+
+    def test_without_a_camera_reports_absence_as_data(self):
+        with mock.patch.object(pixy, "find_video", return_value=None):
+            result = pixy.cmd_snapshot(args_for(["snapshot"]))
+        json.dumps(result)
+        self.assertFalse(result["present"])
 
 
 class ImageCommandTests(unittest.TestCase):
@@ -1935,6 +2928,127 @@ class FourccTests(unittest.TestCase):
     def test_is_little_endian_over_the_characters(self):
         self.assertEqual(pixy.fourcc("ABCD"),
                          ord("A") | (ord("B") << 8) | (ord("C") << 16) | (ord("D") << 24))
+
+
+class FourccNameTests(unittest.TestCase):
+    def test_round_trips_every_format_in_use(self):
+        for code in ("YUYV", "MJPG", "NV12"):
+            self.assertEqual(pixy.fourcc_name(pixy.fourcc(code)), code)
+
+    def test_yuyv_names_itself(self):
+        self.assertEqual(pixy.fourcc_name(pixy.PIXFMT_YUYV), "YUYV")
+
+
+class FormatEnumerationTests(unittest.TestCase):
+    """Struct sizes and decoding for the three nested enumerations."""
+
+    def test_enumeration_ioctl_numbers(self):
+        self.assertEqual(pixy.VIDIOC_ENUM_FMT, 0xC0405602)
+        self.assertEqual(pixy.VIDIOC_ENUM_FRAMESIZES, 0xC02C564A)
+        self.assertEqual(pixy.VIDIOC_ENUM_FRAMEINTERVALS, 0xC034564B)
+
+    def test_struct_sizes_match_the_sizes_encoded_in_the_ioctls(self):
+        # The bug this pins: padding for the *discrete* arm of the union rather
+        # than the whole union under-allocates by 16 bytes, and the ioctl fails as
+        # "SystemError: buffer overflow" rather than anything that names the cause.
+        for ioctl, fmt in (
+            (pixy.VIDIOC_ENUM_FMT, pixy.FMTDESC_FORMAT),
+            (pixy.VIDIOC_ENUM_FRAMESIZES, pixy.FRAMESIZE_FORMAT),
+            (pixy.VIDIOC_ENUM_FRAMEINTERVALS, pixy.FRAMEIVAL_FORMAT),
+        ):
+            self.assertEqual((ioctl >> 16) & 0x3FFF, struct.calcsize(fmt))
+
+    def fake_ioctl(self, formats):
+        """An ioctl that answers the three enumerations from a nested dict.
+
+        Terminates each enumeration with EINVAL, which is how the kernel says
+        "no more" rather than reporting an error.
+        """
+        def handler(fd, request, buf, mutate):
+            if request == pixy.VIDIOC_ENUM_FMT:
+                index = struct.unpack_from("<I", buf, 0)[0]
+                if index >= len(formats):
+                    raise OSError(errno.EINVAL, "no such format")
+                entry = formats[index]
+                struct.pack_into("<III32sI", buf, 0, index,
+                                 pixy.V4L2_BUF_TYPE_VIDEO_CAPTURE, entry.get("flags", 0),
+                                 entry["description"].encode(), pixy.fourcc(entry["fourcc"]))
+                return 0
+            if request == pixy.VIDIOC_ENUM_FRAMESIZES:
+                index, pixel_format = struct.unpack_from("<II", buf, 0)
+                entry = next(f for f in formats
+                             if pixy.fourcc(f["fourcc"]) == pixel_format)
+                if index >= len(entry["sizes"]):
+                    raise OSError(errno.EINVAL, "no such size")
+                width, height, _rates = entry["sizes"][index]
+                struct.pack_into("<IIIII", buf, 0, index, pixel_format,
+                                 pixy.V4L2_FRMSIZE_TYPE_DISCRETE, width, height)
+                return 0
+            if request == pixy.VIDIOC_ENUM_FRAMEINTERVALS:
+                index, pixel_format, width, height = struct.unpack_from("<IIII", buf, 0)
+                entry = next(f for f in formats
+                             if pixy.fourcc(f["fourcc"]) == pixel_format)
+                rates = next(r for w, h, r in entry["sizes"] if (w, h) == (width, height))
+                if index >= len(rates):
+                    raise OSError(errno.EINVAL, "no such interval")
+                struct.pack_into("<IIIIIII", buf, 0, index, pixel_format, width, height,
+                                 pixy.V4L2_FRMIVAL_TYPE_DISCRETE, 1, rates[index])
+                return 0
+            raise OSError(errno.ENOTTY, "unexpected ioctl")
+
+        return handler
+
+    FAKE = [
+        {"fourcc": "MJPG", "description": "Motion-JPEG", "flags": 0x0001,
+         "sizes": [(1920, 1080, [60, 30]), (640, 480, [30])]},
+        {"fourcc": "YUYV", "description": "YUYV 4:2:2",
+         "sizes": [(640, 480, [30])]},
+    ]
+
+    def enumerate(self):
+        with mock.patch.object(pixy.fcntl, "ioctl", side_effect=self.fake_ioctl(self.FAKE)):
+            return pixy.enumerate_formats(42)
+
+    def test_reports_every_format(self):
+        formats = self.enumerate()
+        self.assertEqual([f["fourcc"] for f in formats], ["MJPG", "YUYV"])
+        self.assertEqual(formats[0]["description"], "Motion-JPEG")
+
+    def test_marks_compressed_formats(self):
+        formats = self.enumerate()
+        self.assertTrue(formats[0]["compressed"])
+        self.assertFalse(formats[1]["compressed"])
+
+    def test_sizes_are_largest_first(self):
+        # The panel shows the biggest mode first, and snapshot picks sizes[0] as
+        # the default — so the order is behaviour, not presentation.
+        sizes = self.enumerate()[0]["sizes"]
+        self.assertEqual([(s["width"], s["height"]) for s in sizes],
+                         [(1920, 1080), (640, 480)])
+
+    def test_frame_rates_are_fps_highest_first(self):
+        # Reported as frames per second, not the kernel's interval fraction.
+        self.assertEqual(self.enumerate()[0]["sizes"][0]["fps"], [60.0, 30.0])
+
+    def test_a_driver_that_reports_nothing_yields_an_empty_list(self):
+        with mock.patch.object(pixy.fcntl, "ioctl",
+                               side_effect=OSError(errno.EINVAL, "none")):
+            self.assertEqual(pixy.enumerate_formats(42), [])
+
+    def test_non_discrete_sizes_are_skipped_rather_than_misdecoded(self):
+        # Stepwise and continuous entries have a different payload shape; decoding
+        # one as discrete would report confident, wrong numbers.
+        def handler(fd, request, buf, mutate):
+            if request == pixy.VIDIOC_ENUM_FRAMESIZES:
+                index, pixel_format = struct.unpack_from("<II", buf, 0)
+                if index > 0:
+                    raise OSError(errno.EINVAL, "done")
+                struct.pack_into("<IIIII", buf, 0, index, pixel_format, 2, 640, 480)
+                return 0
+            raise OSError(errno.EINVAL, "done")
+
+        with mock.patch.object(pixy.fcntl, "ioctl", side_effect=handler):
+            self.assertEqual(pixy.enumerate_framesizes(42, pixy.PIXFMT_YUYV), [])
 
 
 class CaptureIoctlEncodingTests(unittest.TestCase):
@@ -2358,16 +3472,39 @@ class ParserTests(unittest.TestCase):
     def test_every_subcommand_binds_a_function(self):
         for argv in (["state"], ["info"], ["holders"], ["mode", "standard"], ["privacy"],
                      ["ptz", "--home"], ["zoom", "120"], ["preset", "save", "1"],
-                     ["image"], ["profile", "list"], ["preview"]):
+                     ["image"], ["profile", "list"], ["preview"], ["vendor"],
+                     ["snapshot"], ["formats"], ["audio"], ["gesture"], ["feature"],
+                     ["metering"], ["auto-privacy"], ["native-preset", "list"]):
             self.assertTrue(callable(args_for(argv).fn), argv)
 
-    def test_only_preview_is_marked_as_streaming(self):
+    def test_only_capturing_commands_are_marked_as_streaming(self):
         # `streams` is what tells main() not to print a return value. Setting it
         # on a non-streaming command would suppress that command's entire reply.
-        self.assertTrue(getattr(args_for(["preview"]), "streams", False))
+        for argv in (["preview"], ["snapshot"]):
+            self.assertTrue(getattr(args_for(argv), "streams", False), argv)
         for argv in (["state"], ["info"], ["holders"], ["privacy"], ["zoom", "120"],
-                     ["image"], ["profile", "list"]):
+                     ["image"], ["profile", "list"], ["vendor"], ["formats"],
+                     ["audio"], ["gesture"], ["feature"], ["metering"],
+                     ["auto-privacy"], ["native-preset", "list"]):
             self.assertFalse(getattr(args_for(argv), "streams", False), argv)
+
+    def test_vendor_subcommands_read_when_given_no_argument(self):
+        # Every vendor setter doubles as a getter, so the panel can read one
+        # feature without a separate command. An argument that became required
+        # would break that.
+        self.assertIsNone(args_for(["audio"]).mode)
+        self.assertIsNone(args_for(["gesture"]).state)
+        self.assertIsNone(args_for(["feature"]).name)
+        self.assertIsNone(args_for(["metering"]).mode)
+        self.assertIsNone(args_for(["auto-privacy"]).seconds)
+
+    def test_metering_area_coordinates_are_integers(self):
+        args = args_for(["metering", "area", "--x", "12", "--y", "34"])
+        self.assertEqual((args.x, args.y), (12, 34))
+
+    def test_native_preset_slot_is_optional_so_list_needs_no_argument(self):
+        self.assertIsNone(args_for(["native-preset", "list"]).slot)
+        self.assertEqual(args_for(["native-preset", "save", "2"]).slot, 2)
 
     def test_nudge_step_defaults_to_five_degrees(self):
         self.assertEqual(args_for(["ptz", "--nudge", "left"]).step, 5)

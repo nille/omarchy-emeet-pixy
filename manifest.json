@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "nille",
   "license": "MIT",
-  "description": "EMEET PIXY webcam control: privacy, AI tracking, pan/tilt/zoom, microphone, image settings, and framing presets.",
+  "description": "EMEET PIXY webcam control: privacy, AI tracking, pan/tilt/zoom, microphone, image settings, framing presets, snapshots, and the camera's own firmware settings.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,17 +14,22 @@
   },
   "barWidget": {
     "displayName": "PIXY",
-    "description": "Close the lens, mute the mic, switch AI tracking on or off, aim the camera, adjust the picture, and recall framing presets.",
+    "description": "Close the lens, mute the mic, switch AI tracking on or off, aim the camera, adjust the picture, recall framing presets, take a snapshot, and set the camera's own firmware options.",
     "category": "System",
     "aliases": ["emeet", "pixy", "webcam", "camera", "ptz", "mic", "microphone",
-                "brightness", "contrast", "exposure", "white balance"],
+                "brightness", "contrast", "exposure", "white balance",
+                "snapshot", "mirror", "flip", "gesture", "focus",
+                "noise cancelling", "auto privacy"],
     "defaultSection": "right",
     "allowMultiple": false,
     "defaults": {
       "refreshIntervalSec": 10,
       "ptzStep": 5,
       "hideWhenAbsent": false,
-      "preview": true
+      "preview": true,
+      "callOpenLens": false,
+      "callTracking": false,
+      "callUnmute": false
     },
     "schema": [
       {
@@ -60,6 +65,27 @@
         "label": "Show video preview",
         "defaultValue": true,
         "description": "Show a small live preview while the panel is open. Only one app can capture at a time, so the preview yields automatically to any app already using the camera. Turn it off to keep the camera free for other apps entirely. The switch on the panel's FRAMING header sets this same value, so either place works."
+      },
+      {
+        "key": "callOpenLens",
+        "type": "boolean",
+        "label": "Open the lens when a call starts",
+        "defaultValue": false,
+        "description": "Uncover the camera as soon as another app starts using it, and close it again when that app lets go. A call is any app holding the video stream, so this needs no list of meeting apps. Only reverses what it changed: a lens that was already open is left open."
+      },
+      {
+        "key": "callTracking",
+        "type": "boolean",
+        "label": "Turn tracking on when a call starts",
+        "defaultValue": false,
+        "description": "Switch the camera to AI tracking for the duration of a call, then restore the mode it was in. Skipped when the camera will not say which mode it is in, since restoring to a guess is worse than not touching it."
+      },
+      {
+        "key": "callUnmute",
+        "type": "boolean",
+        "label": "Unmute the microphone when a call starts",
+        "defaultValue": false,
+        "description": "Unmute the camera's own microphone when a call starts, and mute it again afterwards — but only if it was muted to begin with, so a mic deliberately left on is never muted for you."
       }
     ]
   }
