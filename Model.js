@@ -397,6 +397,131 @@ function callActionLabel(plan) {
   return parts.join(", ")
 }
 
+// ---------------------------------------------------------------- pages
+//
+// *(reported)* "since it is longer than the containing box there is no way to see
+// the preview window when adjusting most of the settings", and then of the floating
+// mini-preview that first answered it: "not sure i love the floating sticky thing".
+//
+// Both reports are the same underlying fact — the panel had grown to roughly two
+// and a half screens, so anything below the fold was reached by scrolling the
+// picture away. The floating dock treated the symptom by making the picture escape
+// the scroll. This treats the cause: the body is split into pages that each fit,
+// the preview is pinned above them where nothing can scroll it, and there is no
+// scrolling to survive in the first place.
+//
+// Consequences worth stating, because they are what make it cheap:
+//
+//   The two sub-pages stop being special. "Advanced image" and "Camera settings"
+//   were already body-replacing pages reached by their own keys with their own Back
+//   rows; they are now two more tabs. That deletes both Back rows, both open/close
+//   pairs, and the `onMainPage` gate that eight sections carried.
+//
+//   Every page is one cursor section. That was already true of the sub-pages, and
+//   it is what keeps j/k honest: one list, no jumping between groups.
+//
+// FRAME is first because it is what the widget is for. SETTINGS is last because it
+// is the page you visit once. MIC sits between IMAGE and SAVED rather than at the
+// end, so the two "adjust a level" pages are neighbours.
+var PAGES = [
+  { key: "frame", label: "FRAME", tooltip: "Aim the camera, mode, presets" },
+  { key: "image", label: "IMAGE", tooltip: "Brightness, contrast, and the rest" },
+  { key: "mic", label: "MIC", tooltip: "The camera's microphone" },
+  { key: "settings", label: "SETTINGS", tooltip: "The camera's own firmware settings" }
+]
+
+// Which pages to draw, given what this camera turned out to have.
+//
+// A tab for a page with nothing on it is worse than a missing tab: it is a place to
+// go that says nothing when you get there, and it costs a keypress to discover
+// that. So MIC needs a microphone on the graph and IMAGE needs controls the driver
+// answered for — the same conditions those sections already hid themselves under.
+//
+// FRAME is unconditional. It is where "no camera found" is explained, so it has to
+// exist before anything is known.
+function visiblePages(caps) {
+  var c = caps || {}
+  var out = []
+  for (var i = 0; i < PAGES.length; i++) {
+    var page = PAGES[i]
+    if (page.key === "image" && !c.hasImage) continue
+    if (page.key === "mic" && !c.hasMic) continue
+    // Every settings row is a vendor HID write, so without the HID interface the
+    // page is a list of controls that cannot do anything.
+    if (page.key === "settings" && !c.hasVendor) continue
+    out.push(page)
+  }
+  return out
+}
+
+// The page to land on when the list changes under the current one.
+//
+// A camera whose mic node disappears — unplugged, or PipeWire restarting — takes
+// the MIC page with it, and the panel would otherwise be showing a page that is no
+// longer in the tab bar: no tab highlighted, and h/l with nowhere to start from.
+// Falling back to the first page rather than the nearest neighbour, because the
+// first page is the only one guaranteed to exist.
+function resolvePage(wanted, pages) {
+  var list = (pages && pages.length) ? pages : []
+  if (!list.length) return ""
+  for (var i = 0; i < list.length; i++)
+    if (list[i].key === wanted) return wanted
+  return list[0].key
+}
+
+// Step to the next or previous page, stopping at the ends.
+//
+// Stopping rather than wrapping, unlike the chip groups: a tab bar is a row of
+// places with a left and a right end, and wrapping from SETTINGS back to FRAME
+// reads as the panel having jumped somewhere rather than moved. The chips wrap
+// because a three-option cycle has no ends to speak of.
+//
+// `[` and `]` drive this, not Tab — Tab belongs to the bar, which uses it to move
+// between panels, and not h/l, which sweeps whatever slider the cursor is on.
+function stepPage(current, pages, direction) {
+  var list = (pages && pages.length) ? pages : []
+  if (!list.length) return ""
+  var at = 0
+  for (var i = 0; i < list.length; i++)
+    if (list[i].key === current) at = i
+  var next = at + (direction > 0 ? 1 : -1)
+  if (next < 0 || next >= list.length) return list[at].key
+  return list[next].key
+}
+
+function pageIndex(key, pages) {
+  var list = (pages && pages.length) ? pages : []
+  for (var i = 0; i < list.length; i++)
+    if (list[i].key === key) return i
+  return -1
+}
+
+// The hint line under each page. Per page because the keys differ, and a hint
+// naming a key that does nothing here is worse than no hint: it sends someone
+// pressing `s` on a page with nothing to save.
+//
+// `[`/`]` is named on every page because it is the one key that is new. It is not
+// h/l, which adjusts whatever the cursor is on — the panel's main gesture — and it is
+// not Tab: every other panel in the shell binds Tab to switching *bar* panels, and a
+// plugin that quietly means something else by it is worse than a less obvious key.
+function pageHints(page, caps) {
+  var c = caps || {}
+  var keys = ["[/] page"]
+  if (page === "frame") {
+    keys.push("j/k move", "h/l adjust", "1-3 recall", "s save", "x clear",
+              "p privacy", "t tracking", "c recenter", "v preview")
+  } else if (page === "image") {
+    keys.push("j/k move", "h/l adjust", "enter toggle", "n name", "x clear")
+  } else if (page === "mic") {
+    keys.push("h/l level", "m mute")
+  } else if (page === "settings") {
+    keys.push("j/k move", "h/l change", "enter toggle", "x clear slot")
+  }
+  if (c.hasMic && page !== "mic") keys.push("m mute")
+  keys.push("r refresh", "esc close")
+  return keys.join(" · ")
+}
+
 // ---------------------------------------------------------------- preview
 //
 // Only one process can hold the V4L2 stream at a time, and that cuts both ways:
@@ -469,104 +594,15 @@ function previewHint(state, enabled, opened, capturing) {
   return ""
 }
 
-// 16:9, the only shape the preview is ever drawn in — in its frame and docked
-// alike, so the picture never changes proportions as it moves.
+// 16:9, the only shape the preview is ever drawn in.
+//
+// The preview used to float: it sat in a slot in the FRAMING section and shrank
+// into the corner of the viewport once that slot scrolled away, which is what
+// previewDock computed. That is gone, and so is the arithmetic — the panel is
+// paged now, so no page is tall enough to scroll the picture off and the preview is
+// pinned above the pages where nothing can move it. Fixing the height rather than
+// tracking a scroll is the whole difference: there is no scroll to track.
 var PREVIEW_ASPECT = 9 / 16
-
-// How much of the panel's width the docked picture keeps.
-//
-// *(reported)* "the preview window is too small". It was a third, chosen on the
-// theory that the rows it floats over should stay readable — but the rows it covers
-// are the ones you are done with, and the picture is the one you are looking at. A
-// third of a 360-wide panel is 120×68, which is enough to see that something moved
-// and not enough to see *what*: a focus change or a brightness step is a few pixels
-// of difference at that size, and judging those is the entire reason it follows the
-// scroll at all.
-//
-// Two thirds instead. Still a corner picture rather than a second full preview —
-// the labels beside it are readable and the sliders it sits above are not covered,
-// since those run the panel's full width and it only takes the top strip.
-var PREVIEW_DOCK_FRACTION = 2 / 3
-
-// Where to draw the preview, given where its place in the FRAMING section
-// currently is relative to the viewport.
-//
-// *(reported)* The panel is taller than the box that holds it, so adjusting almost
-// anything scrolls the preview off the top — and the picture is exactly what half
-// these controls are for. Mirroring, focus, brightness and the image sliders are
-// all "watch it change" settings, and watching it change meant scrolling up and
-// losing the control.
-//
-// So the preview leaves the scrolling flow and floats above it: it draws in its own
-// frame while that frame is on screen, and shrinks into a small picture-in-picture
-// in a corner of the viewport once the frame has scrolled away. `progress` is the
-// interpolation between those two, driven by how far the frame has gone past the
-// top edge, which is what makes it read as the same object moving rather than a
-// second preview appearing.
-//
-// The alternative — pinning it under the hero permanently — was rejected because it
-// spends a third of the panel on the picture even on the pages where the picture is
-// not the point. The docked size is a third of the width, which is small enough to
-// leave the labels under it readable and large enough to see a mirror flip.
-//
-// `slot` is {y, height, width, available}, where y is the frame's top in viewport
-// coordinates and `available` says whether the slot is on screen at all — the
-// sub-pages replace the panel body, so there is no frame to sit in there and the
-// preview is docked outright. `view` is {width, height, inset, miniWidth, corner,
-// compactBelow}.
-//
-// A pure function of two rectangles: the panel binds it to the scroll position, and
-// everything about where the picture goes is decided and tested here.
-function previewDock(slot, view) {
-  var v = view || {}
-  var viewWidth = Math.max(0, Number(v.width) || 0)
-  var viewHeight = Math.max(0, Number(v.height) || 0)
-  var inset = Math.max(0, Number(v.inset) || 0)
-  var mini = Math.max(0, Number(v.miniWidth) || 0)
-
-  var s = slot || {}
-  var slotWidth = Math.max(0, Number(s.width) || 0)
-  var slotTop = Number(s.y)
-  if (!isFinite(slotTop)) slotTop = 0
-
-  // Docked outright when there is no frame on screen to be in.
-  var progress = 1
-  if (s.available) {
-    // The travel is the frame's own height, so the shrink finishes exactly as the
-    // frame finishes leaving — any other distance makes the two look unrelated.
-    var travel = Math.max(1, Number(s.height) || 1)
-    progress = clamp(-slotTop / travel, 0, 1)
-  }
-
-  var width = Math.round(slotWidth + (mini - slotWidth) * progress)
-  var height = Math.round(width * PREVIEW_ASPECT)
-
-  // Both ends computed at the *current* width rather than at their own, so the
-  // picture slides and shrinks together instead of drifting out of its own corner.
-  var inPlaceX = (viewWidth - width) / 2
-  var dockedX = viewWidth - inset - width
-  var dockedY = v.corner === "bottom" ? viewHeight - inset - height : inset
-
-  return {
-    progress: progress,
-    docked: progress > 0,
-    // Whether the placeholder has to drop its explanatory sentence and keep the
-    // glyph. Measured against the frame's actual width rather than against
-    // `progress`, because those two stopped agreeing when the docked size grew: at
-    // two thirds of the panel the fully-docked frame is wide enough for the text, so
-    // a progress threshold would hide a sentence that fits.
-    //
-    // The panel supplies the width to compare against, since what "too narrow for a
-    // sentence" means is a question about the theme's font, which Model cannot see.
-    // Absent, nothing is compact — the visible failure is a clipped line of text,
-    // which is better than silently hiding an explanation on every size.
-    compact: width < Math.max(0, Number(v.compactBelow) || 0),
-    x: Math.round(inPlaceX + (dockedX - inPlaceX) * progress),
-    y: Math.round(slotTop + (dockedY - slotTop) * progress),
-    width: width,
-    height: height
-  }
-}
 
 // Codepoints are md-eye (U+F0208) and md-eye_off (U+F0209), verified present in
 // the Nerd Font by glyph name rather than by eyeballing the shape.
