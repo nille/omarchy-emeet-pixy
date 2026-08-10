@@ -1977,9 +1977,11 @@ Panel {
             spacing: Style.spacing.sm
             options: root.pages
             value: root.page
-            // The label is what the chip says; the key is what it means. PAGES
-            // carries both, and ButtonGroup keys on `value`, so this needs no
-            // mapping — which is why the page keys are strings rather than indices.
+            // The label is what the chip says; `value` is what it means. PAGES
+            // carries both under exactly the names ButtonGroup reads, so there is no
+            // mapping step here — see the note on PAGES for what happened when the
+            // field was named `key` instead, and why the fix was to rename the field
+            // rather than to map it on the way in.
             foreground: root.foreground
             accent: root.accent
             background: root.bar ? root.bar.background : Color.background
