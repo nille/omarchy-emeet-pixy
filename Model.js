@@ -595,21 +595,20 @@ function previewHint(state, enabled, opened, capturing) {
   if (reason === "busy") return "Only one app can capture at a time. Controls still work."
   // Not currently rendered — the panel hides the whole frame when the preview is
   // off rather than leaving a placeholder — but kept correct and kept here so the
-  // string does not have to be reinvented if that changes. It used to point at the
-  // widget settings dialog, which is now the wrong instruction: the switch is on
-  // the FRAMING header, a few lines above where this would appear.
-  if (reason === "disabled") return "Turn it back on with the switch above."
+  // string does not have to be reinvented if that changes. It names the switch on
+  // the FRAMING header rather than the widget settings dialog it used to point at,
+  // and names the page rather than a direction: the switch is on FRAME and the
+  // preview is pinned above every page, so "above" is only true on one of them.
+  if (reason === "disabled") return "Turn it back on with the switch on FRAME."
   return ""
 }
 
 // 16:9, the only shape the preview is ever drawn in.
 //
-// The preview used to float: it sat in a slot in the FRAMING section and shrank
-// into the corner of the viewport once that slot scrolled away, which is what
-// previewDock computed. That is gone, and so is the arithmetic — the panel is
-// paged now, so no page is tall enough to scroll the picture off and the preview is
-// pinned above the pages where nothing can move it. Fixing the height rather than
-// tracking a scroll is the whole difference: there is no scroll to track.
+// It used to float: it sat in a slot among the framing rows and shrank into the
+// corner of the viewport once that slot scrolled away, which is what previewDock
+// computed. Pinned above the pages there is no scroll under it to track, so a fixed
+// aspect is the whole of the sizing.
 var PREVIEW_ASPECT = 9 / 16
 
 // Codepoints are md-eye (U+F0208) and md-eye_off (U+F0209), verified present in
