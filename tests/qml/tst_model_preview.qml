@@ -156,12 +156,13 @@ Item {
     }
 
     function test_the_disabled_hint_points_at_the_switch_not_at_settings() {
-      // There is a switch on the FRAMING header now. Sending someone to the widget
-      // settings dialog while a control sits a few lines above would be actively
-      // misleading, so this asserts the old instruction is gone.
+      // There is a switch on the FRAMING header now, so sending someone to the widget
+      // settings dialog would be actively misleading. It names the page too: the
+      // preview is pinned above all four, so "the switch above" is only true on FRAME.
       var hint = Model.previewHint(cam({}), false, true)
-      verify(hint.indexOf("switch") >= 0)
-      verify(hint.indexOf("settings") < 0)
+      verify(hint.indexOf("switch") >= 0, hint)
+      verify(hint.indexOf("FRAME") >= 0, hint)
+      verify(hint.indexOf("settings") < 0, hint)
     }
 
     // ---- the switch's glyph ----
