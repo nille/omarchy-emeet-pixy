@@ -9,7 +9,7 @@ widget that looks and behaves like the first-party ones.
 
 | FRAME | IMAGE | SETTINGS | Lens closed |
 | --- | --- | --- | --- |
-| ![The FRAME tab: privacy switch, pinned preview, mode chips, jog pad, pan/tilt/zoom sliders and the framing presets](docs/panel-frame.png) | ![The IMAGE tab: every control the driver reports, plus named picture profiles](docs/panel-image.png) | ![The SETTINGS tab: the camera's own firmware settings](docs/panel-settings.png) | ![Privacy mode: the preview collapsed to a closed-lens placeholder, the mode chips dimmed](docs/panel-privacy.png) |
+| ![The FRAME tab: privacy switch, the preview switch and the pinned preview, mode chips, jog pad, pan/tilt/zoom sliders and the framing presets](docs/panel-frame.png) | ![The IMAGE tab: every control the driver reports, plus named picture profiles](docs/panel-image.png) | ![The SETTINGS tab: the camera's own firmware settings](docs/panel-settings.png) | ![Privacy mode: the preview collapsed to a closed-lens placeholder, the mode chips dimmed](docs/panel-privacy.png) |
 
 ## What it does
 
