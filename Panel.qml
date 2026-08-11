@@ -650,16 +650,16 @@ Panel {
   // walking between groups and no section that scrolls into view as you reach it.
   //
   // The rows on each page, top to bottom:
-  //   "frame"    - mode chips (0), preview switch (1), pan (2), tilt (3), zoom (4),
-  //                recenter (5), then one row per preset slot
+  //   "frame"    - mode chips (0), pan (1), tilt (2), zoom (3), recenter (4), then
+  //                one row per preset slot
   //   "image"    - one row per control, then one per saved profile, then the save
   //                field
   //   "mic"      - the volume slider (0)
   //   "settings" - the firmware rows, in drawn order
   //
-  // The privacy switch is in the hero above the tabs, so it is on every page and
-  // belongs to none: "header" is a section with no rows that j/k never walks into,
-  // reached by hovering the switch and by `p`.
+  // Two switches sit above the tabs — privacy in the hero, preview over the picture —
+  // so they are on every page and belong to none. "header" is where they live: a
+  // section with no rows, which is what makes j/k walk only the page.
   //
   // The jog pad is deliberately not a cursor row: PanelKeyCatcher maps the arrow
   // keys to the same signal as h/j/k/l, so a 2D pad has no keys of its own to
@@ -669,7 +669,18 @@ Panel {
   property int selectedIndex: 0
   property bool cursorActive: false
 
-  readonly property bool headerHasCursor: cursorActive && focusSection === "header"
+  // The two pinned switches, indexed *below* zero. Negative is what "not a row on
+  // any page" already meant here — moveCursor's `selectedIndex < 0` guard brings j
+  // onto row 0 from either of them, and sectionCount("header") staying 0 is what
+  // keeps j/k out of them in the first place. So a second pinned switch costs a
+  // constant rather than a fourth piece of cursor state.
+  readonly property int headerPrivacyIndex: -1
+  readonly property int headerPreviewIndex: -2
+
+  readonly property bool privacyHasCursor: cursorActive && focusSection === "header"
+    && selectedIndex === headerPrivacyIndex
+  readonly property bool previewHasCursor: cursorActive && focusSection === "header"
+    && selectedIndex === headerPreviewIndex
 
   function sectionCount(section) {
     if (section === "header") return 0
@@ -689,12 +700,11 @@ Panel {
   // page because they *are* framing — a preset recalls where the lens points — and
   // the page has room for them now.
   readonly property int frameModeRow: 0
-  readonly property int framePreviewRow: 1
-  readonly property int framePanRow: 2
-  readonly property int frameTiltRow: 3
-  readonly property int frameZoomRow: 4
-  readonly property int frameHomeRow: 5
-  readonly property int framePresetRow: 6
+  readonly property int framePanRow: 1
+  readonly property int frameTiltRow: 2
+  readonly property int frameZoomRow: 3
+  readonly property int frameHomeRow: 4
+  readonly property int framePresetRow: 5
 
   function framePresetAt(index) {
     var i = index - framePresetRow
@@ -816,10 +826,10 @@ Panel {
     setAutoPrivacy(choices[(at + direction + choices.length) % choices.length].seconds)
   }
 
-  function setHeaderCursor() {
+  function setHeaderCursor(index) {
     cursorActive = true
     focusSection = "header"
-    selectedIndex = -1
+    selectedIndex = index === undefined ? headerPrivacyIndex : index
   }
 
   function setCursor(section, index) {
@@ -835,7 +845,7 @@ Panel {
   function moveCursor(delta) {
     var max = sectionCount(focusSection) - 1
     if (max < 0) return
-    // Arriving from the hero switch, which is not a row on any page.
+    // Arriving from a pinned switch, which is not a row on any page.
     if (focusSection === "header" || selectedIndex < 0) { selectedIndex = 0; return }
     selectedIndex = Math.max(0, Math.min(max, selectedIndex + (delta > 0 ? 1 : -1)))
   }
@@ -859,9 +869,9 @@ Panel {
       return
     }
     if (focusSection !== "frame") return
-    // The mode chips and the preview switch are both boolean-ish, so h/l has
-    // nothing to sweep on them — Enter, `t` and `v` are their interaction. The
-    // presets likewise: Enter recalls, `s` saves, `x` clears.
+    // The mode chips are boolean-ish, so h/l has nothing to sweep on them — Enter
+    // and `t` are their interaction. The presets likewise: Enter recalls, `s` saves,
+    // `x` clears.
     if (selectedIndex === frameModeRow)
       setMode(camera.mode === "tracking" ? "standard" : "tracking")
     else if (selectedIndex === framePanRow) setPan(shownPan + direction * ptzStep)
@@ -908,14 +918,20 @@ Panel {
   }
 
   function activateCursor() {
-    if (focusSection === "header") { togglePrivacy(); return }
+    if (focusSection === "header") {
+      // Whichever pinned switch the cursor is on. Privacy is the default because it
+      // is where the cursor lands when the camera is absent and there is nothing else
+      // to reach.
+      if (selectedIndex === headerPreviewIndex) togglePreview()
+      else togglePrivacy()
+      return
+    }
     if (focusSection === "frame") {
       // Sliders have no activate action — h/l is their whole interaction.
       if (selectedIndex === frameModeRow) {
         setMode(camera.mode === "tracking" ? "standard" : "tracking")
         return
       }
-      if (selectedIndex === framePreviewRow) { togglePreview(); return }
       if (selectedIndex === frameHomeRow) { home(); return }
       var slot = framePresetAt(selectedIndex)
       // Recall a saved slot, store into an empty one. One key doing both is what
@@ -960,8 +976,8 @@ Panel {
   // lists it indexes into come from outside: the driver decides how many image
   // controls there are and the user decides how many profiles.
   function clampCursor() {
-    // "header" has no rows, so let it through rather than knocking the cursor
-    // off the privacy switch every time a refresh republishes state.
+    // "header" has no rows, so let it through rather than knocking the cursor off a
+    // pinned switch every time a refresh republishes state.
     if (focusSection === "header") return
     // The section *is* the page, so a mismatch means one of them was set without
     // the other. The page is the authority: it is what is drawn.
@@ -1692,7 +1708,7 @@ Panel {
       lastSnapshot = null
       callNote = ""
       focusSection = present ? "frame" : "header"
-      selectedIndex = present ? 0 : -1
+      selectedIndex = present ? 0 : headerPrivacyIndex
       cursorActive = false
       // Clear a previous session's failure so a camera that was busy last time
       // gets a fresh attempt rather than showing a stale message forever.
@@ -1899,18 +1915,19 @@ Panel {
             }
           }
 
-          // The quick lens-cover, and the header's only cursor target.
+          // The quick lens-cover. One of the two pinned switches — the preview switch
+          // below the tabs is the other — so it takes the cursor without being a row.
           trailingControl: Component {
             ToggleSwitch {
               id: privacySwitch
               checked: root.privacy
-              hasCursor: root.headerHasCursor
+              hasCursor: root.privacyHasCursor
               foreground: root.foreground
               // Privacy reads as an alert state, not a neutral preference.
               accent: root.urgent
               enabled: root.present
               opacity: enabled ? 1.0 : 0.4
-              onHovered: function(on) { if (on) root.setHeaderCursor() }
+              onHovered: function(on) { if (on) root.setHeaderCursor(root.headerPrivacyIndex) }
               onToggled: root.togglePrivacy()
 
               PanelToolTip {
@@ -1956,6 +1973,87 @@ Panel {
             focusable: false
             cursorIndex: -1
             onChanged: function(value) { root.showPage(value) }
+          }
+        }
+
+        // ---------- Preview switch ----------
+        //
+        // *(reported)* "the button to control preview is too far from the preview
+        // window". It was on the FRAMING header, which put MODE and a separator
+        // between the switch and the picture it governs — and left it on FRAME, so on
+        // the three tabs where a preview costs you a call it was two keys away.
+        //
+        // Above the picture rather than below it, because the frame collapses when the
+        // switch goes off: anchored underneath, the switch would jump up the height of
+        // the preview at the moment of being pressed, and land under the pointer that
+        // pressed it. Above, nothing moves but the thing being turned off.
+        //
+        // Its own row rather than a corner of the tab bar or an overlay on the video:
+        // the bar is already four chips wide at this width, and an overlay would
+        // vanish with the frame it sits on, leaving no way back.
+        CursorSurface {
+          id: previewRow
+          width: parent.width
+          implicitHeight: previewToggle.implicitHeight + Style.spacing.controlGap
+          visible: root.present
+          hasCursor: root.previewHasCursor
+          foreground: root.foreground
+          accent: root.accent
+          outline: false
+
+          // The whole row takes the cursor, not just the switch: the label and the
+          // eye are what the pointer is aiming at when someone is looking for this.
+          HoverHandler {
+            onHoveredChanged: if (hovered) root.setHeaderCursor(root.headerPreviewIndex)
+          }
+
+          Text {
+            id: previewGlyph
+            text: Model.previewIcon(root.previewEnabled)
+            color: root.previewEnabled ? root.foreground : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.icon
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          // Named in words as well as by the eye. On the FRAMING header the glyph
+          // alone had to do, because a word would not fit beside the angle readout;
+          // a row of its own has the width, and "PREVIEW" is what someone hunting
+          // for this control is reading for.
+          PanelSectionHeader {
+            text: "PREVIEW"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            anchors.left: previewGlyph.right
+            anchors.leftMargin: Style.spacing.sm
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          // A switch and not a settings-dialog trip: releasing the camera for a call
+          // is a thing done *during* the call, and the only reason it ever lived in
+          // the settings schema alone is that it started as a preference rather than
+          // an action.
+          ToggleSwitch {
+            id: previewToggle
+            checked: root.previewEnabled
+            hasCursor: previewRow.hasCursor
+            foreground: root.foreground
+            accent: root.accent
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            onHovered: function(on) { if (on) root.setHeaderCursor(root.headerPreviewIndex) }
+            onToggled: root.togglePreview()
+
+            PanelToolTip {
+              visible: previewToggle.containsMouse
+              text: root.previewEnabled
+                ? "Turn the preview off — frees the camera for other apps"
+                : "Turn the preview on"
+              fontFamily: root.fontFamily
+            }
           }
         }
 
@@ -2292,10 +2390,8 @@ Panel {
 
             Item {
               width: parent.width
-              implicitHeight: Math.max(Math.max(framingHeader.implicitHeight,
-                                                positionValue.implicitHeight),
-                                       Math.max(previewGlyph.implicitHeight,
-                                                previewToggle.implicitHeight))
+              implicitHeight: Math.max(framingHeader.implicitHeight,
+                                       positionValue.implicitHeight)
 
               PanelSectionHeader {
                 id: framingHeader
@@ -2306,64 +2402,8 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
               }
 
-              // Labels the switch. A bare switch on a "FRAMING" header would be
-              // ambiguous — there are three other things in the section it could
-              // plausibly gate — and the eye is doing the work a word would, at
-              // the width a word would not fit in. It stays here rather than moving
-              // up next to the pinned picture: the switch decides whether the picture
-              // is drawn at all, and a control anchored to the thing it can make
-              // disappear would be a control that moves when you use it.
-              Text {
-                id: previewGlyph
-                text: Model.previewIcon(root.previewEnabled)
-                color: root.previewEnabled ? root.foreground : root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.icon
-                anchors.right: previewToggle.left
-                anchors.rightMargin: Style.spacing.sm
-                anchors.verticalCenter: parent.verticalCenter
-              }
-
-              // The preview switch lives on the FRAMING header rather than in a
-              // section of its own, because the preview is a framing aid and the
-              // switch is the label for the thing directly below it. It is also
-              // where someone looks when the video is the problem.
-              //
-              // A switch and not a settings-dialog trip: releasing the camera for
-              // a call is a thing done *during* the call, and the only reason it
-              // ever lived in the settings schema alone is that it started as a
-              // preference rather than an action.
-              ToggleSwitch {
-                id: previewToggle
-                checked: root.previewEnabled
-                hasCursor: root.cursorActive && root.focusSection === "frame"
-                  && root.selectedIndex === root.framePreviewRow
-                foreground: root.foreground
-                accent: root.accent
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                onHovered: function(on) { if (on) root.setCursor("frame", root.framePreviewRow) }
-                onToggled: root.togglePreview()
-                // Anchored in a plain Item rather than wrapped in a CursorSurface:
-                // the header row is not a full-width control, and a ring around the
-                // whole row would claim the "FRAMING" label too. The switch draws
-                // its own ring, so all that is missing is the scroll-into-view the
-                // CursorSurface rows get for free.
-                onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(previewToggle)
-
-                PanelToolTip {
-                  visible: previewToggle.containsMouse
-                  text: root.previewEnabled
-                    ? "Turn the preview off — frees the camera for other apps"
-                    : "Turn the preview on"
-                  fontFamily: root.fontFamily
-                }
-              }
-
-              // Yields the header's right edge to the switch. The angle readout is
-              // a duplicate — both sliders below show it — so it is the thing that
-              // gives way rather than the control.
+              // Has the right edge to itself again, now that the preview switch is
+              // pinned beside the picture instead of sharing this row.
               Text {
                 id: positionValue
                 text: Model.positionLabel(root.shownPan, root.shownTilt)
@@ -2371,8 +2411,8 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
-                anchors.right: previewGlyph.left
-                anchors.rightMargin: Style.spacing.md
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
                 anchors.verticalCenter: parent.verticalCenter
               }
             }

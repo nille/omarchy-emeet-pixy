@@ -156,12 +156,14 @@ Item {
     }
 
     function test_the_disabled_hint_points_at_the_switch_not_at_settings() {
-      // There is a switch on the FRAMING header now, so sending someone to the widget
-      // settings dialog would be actively misleading. It names the page too: the
-      // preview is pinned above all four, so "the switch above" is only true on FRAME.
+      // There is a switch in the panel now, so sending someone to the widget settings
+      // dialog would be actively misleading. "Above" is the direction and is true from
+      // every page: *(reported)* "the button to control preview is too far from the
+      // preview window" pinned the switch over the picture, so this stopped having to
+      // name a page.
       var hint = Model.previewHint(cam({}), false, true)
       verify(hint.indexOf("switch") >= 0, hint)
-      verify(hint.indexOf("FRAME") >= 0, hint)
+      verify(hint.indexOf("above") >= 0, hint)
       verify(hint.indexOf("settings") < 0, hint)
     }
 

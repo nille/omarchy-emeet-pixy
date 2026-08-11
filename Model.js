@@ -518,7 +518,7 @@ function pageHints(page, caps) {
   var keys = ["[/] page"]
   if (page === "frame") {
     keys.push("j/k move", "h/l adjust", "1-3 recall", "s save", "x clear",
-              "p privacy", "t tracking", "c recenter", "v preview")
+              "t tracking", "c recenter")
   } else if (page === "image") {
     keys.push("j/k move", "h/l adjust", "enter toggle", "s name", "x clear")
   } else if (page === "mic") {
@@ -527,7 +527,11 @@ function pageHints(page, caps) {
     keys.push("j/k move", "h/l change", "enter toggle", "x clear slot")
   }
   if (c.hasMic && page !== "mic") keys.push("m mute")
-  keys.push("r refresh", "esc close")
+  // Privacy and preview are named on every page, with the rest of the panel-wide
+  // keys, because both switches are pinned above the tabs and are on every page.
+  // `v` was in the FRAME list while the switch was on the FRAMING header, which
+  // read as the key being FRAME's too.
+  keys.push("p privacy", "v preview", "r refresh", "esc close")
   return keys.join(" · ")
 }
 
@@ -596,11 +600,11 @@ function previewHint(state, enabled, opened, capturing) {
   if (reason === "busy") return "Only one app can capture at a time. Controls still work."
   // Not currently rendered — the panel hides the whole frame when the preview is
   // off rather than leaving a placeholder — but kept correct and kept here so the
-  // string does not have to be reinvented if that changes. It names the switch on
-  // the FRAMING header rather than the widget settings dialog it used to point at,
-  // and names the page rather than a direction: the switch is on FRAME and the
-  // preview is pinned above every page, so "above" is only true on one of them.
-  if (reason === "disabled") return "Turn it back on with the switch on FRAME."
+  // string does not have to be reinvented if that changes. It names the switch
+  // rather than the widget settings dialog it used to point at, and "above" is a
+  // direction again now that the switch is pinned over the picture on every page:
+  // it was "on FRAME" while the switch lived on the FRAMING header.
+  if (reason === "disabled") return "Turn it back on with the switch above."
   return ""
 }
 
