@@ -1,9 +1,9 @@
 // The FRAME page's row arithmetic.
 //
 // The page the panel opens on, and the only one whose rows are four different kinds of
-// thing under one cursor: the mode chips, the preview switch, three sliders, the
-// recenter button, and then the three preset slots. Nine rows, one of which is a group
-// whose length comes from Model.
+// thing under one cursor: the mode chips, three sliders, the recenter button, and then
+// the three preset slots. Eight rows, one of which is a group whose length comes from
+// Model.
 //
 // Two failures here move hardware, which is what separates this page from the other
 // two cursor suites:
@@ -50,13 +50,21 @@ Item {
     return 0
   }
 
+  // The two pinned switches, replicated with the rows they are deliberately not.
+  readonly property int headerPrivacyIndex: -1
+  readonly property int headerPreviewIndex: -2
+
+  // activateCursor's header branch.
+  function headerActionAt(index) {
+    return index === headerPreviewIndex ? "preview" : "privacy"
+  }
+
   readonly property int frameModeRow: 0
-  readonly property int framePreviewRow: 1
-  readonly property int framePanRow: 2
-  readonly property int frameTiltRow: 3
-  readonly property int frameZoomRow: 4
-  readonly property int frameHomeRow: 5
-  readonly property int framePresetRow: 6
+  readonly property int framePanRow: 1
+  readonly property int frameTiltRow: 2
+  readonly property int frameZoomRow: 3
+  readonly property int frameHomeRow: 4
+  readonly property int framePresetRow: 5
 
   function framePresetAt(index) {
     var i = index - framePresetRow
@@ -86,7 +94,6 @@ Item {
 
   function actionAt(index) {
     if (index === frameModeRow) return "mode"
-    if (index === framePreviewRow) return "preview"
     if (index === frameHomeRow) return "recenter"
     var slot = framePresetAt(index)
     if (slot) return (savedSlots.indexOf(slot) >= 0 ? "recall:" : "store:") + slot
@@ -96,7 +103,7 @@ Item {
   }
 
   // What h/l does, in adjustHorizontal's order. "" means the row has no horizontal
-  // action — which is correct for the preview switch, recenter and the slots.
+  // action — which is correct for recenter and the slots.
   function adjustAt(index) {
     if (index === frameModeRow) return "mode"
     if (index === framePanRow) return "pan"
@@ -118,11 +125,11 @@ Item {
     // ---- the row count matches the rows that exist ----
 
     function test_the_count_reaches_the_last_slot_and_stops() {
-      // Mode, preview, pan, tilt, zoom, recenter, then a row per slot. Written out
-      // against the real slot count so a fourth slot has to come through here.
+      // Mode, pan, tilt, zoom, recenter, then a row per slot. Written out against
+      // the real slot count so a fourth slot has to come through here.
       compare(Model.PRESET_SLOTS.length, 3)
-      compare(root.sectionCount("frame"), 9)
-      compare(root.framePresetRow, 6)
+      compare(root.sectionCount("frame"), 8)
+      compare(root.framePresetRow, 5)
     }
 
     function test_the_mode_row_is_the_first_row() {
@@ -146,8 +153,8 @@ Item {
         seen.push(root.actionAt(root.selectedIndex))
         root.moveCursor(1)
       }
-      compare(seen.slice(0, 9).join(" "),
-              "mode preview slider slider slider recenter recall:1 store:2 store:3")
+      compare(seen.slice(0, 8).join(" "),
+              "mode slider slider slider recenter recall:1 store:2 store:3")
       compare(root.selectedIndex, root.sectionCount("frame") - 1)
     }
 
@@ -196,11 +203,10 @@ Item {
       compare(root.adjustAt(root.frameZoomRow), "zoom")
     }
 
-    function test_the_preview_switch_and_recenter_have_no_horizontal_action() {
-      // Both are single actions with Enter as their key — plus `v` and `c`. h/l on
-      // them must do nothing rather than fall into a neighbouring slider, which is
-      // what a chain of else-ifs produces when a case is dropped.
-      compare(root.adjustAt(root.framePreviewRow), "")
+    function test_recenter_has_no_horizontal_action() {
+      // A single action with Enter as its key — plus `c`. h/l on it must do nothing
+      // rather than fall into a neighbouring slider, which is what a chain of
+      // else-ifs produces when a case is dropped.
       compare(root.adjustAt(root.frameHomeRow), "")
     }
 
@@ -251,9 +257,9 @@ Item {
       // slider disabled rather than vanishing — so unlike IMAGE there is no shape here
       // for a failed read to change. Pinned so a "hide what we could not read" change
       // has to come through the cursor arithmetic too.
-      compare(root.sectionCount("frame"), 9)
+      compare(root.sectionCount("frame"), 8)
       root.savedSlots = []
-      compare(root.sectionCount("frame"), 9)
+      compare(root.sectionCount("frame"), 8)
       for (var i = 0; i < root.sectionCount("frame"); i++)
         verify(root.actionAt(i) !== "nothing", "row " + i + " does nothing")
     }
@@ -269,18 +275,39 @@ Item {
       compare(root.selectedIndex, 0)
     }
 
-    function test_the_hero_switch_is_not_a_row_and_j_comes_onto_the_page() {
-      // The privacy switch above the tabs takes the cursor, and it is not a row on any
-      // page. j from it has to land on the first row rather than on row 1, and
-      // clampCursor must leave it alone or a refresh would knock the cursor off it.
-      root.focusSection = "header"
-      root.selectedIndex = 0
-      root.clampCursor()
-      compare(root.focusSection, "header")
-      root.focusSection = "frame"
-      root.selectedIndex = -1
-      root.moveCursor(1)
-      compare(root.selectedIndex, 0)
+    // *(reported)* "the button to control preview is too far from the preview window"
+    // took the preview switch off this page and pinned it over the picture, next to
+    // the privacy switch. So there are two off-page switches now, and they are told
+    // apart by index below zero — which is the same value moveCursor already read as
+    // "not on a row".
+    function test_the_two_pinned_switches_are_not_rows_and_j_comes_onto_the_page() {
+      // Neither switch is a row on any page, so j from either has to land on row 0
+      // rather than on row 1 — and clampCursor must leave them alone, or a refresh
+      // would knock the cursor off a switch every time state republished.
+      var pinned = [root.headerPrivacyIndex, root.headerPreviewIndex]
+      for (var i = 0; i < pinned.length; i++) {
+        verify(pinned[i] < 0, "pinned switch " + i + " is a row index")
+        root.focusSection = "header"
+        root.selectedIndex = pinned[i]
+        root.clampCursor()
+        compare(root.focusSection, "header")
+        compare(root.selectedIndex, pinned[i])
+        root.focusSection = "frame"
+        root.moveCursor(1)
+        compare(root.selectedIndex, 0)
+      }
+      // Distinct, or hovering one would draw the ring on both and Enter would reach
+      // the wrong switch.
+      verify(root.headerPrivacyIndex !== root.headerPreviewIndex)
+    }
+
+    function test_enter_on_a_pinned_switch_reaches_that_switch_and_no_row() {
+      // activateCursor's header branch is a two-way choice on the index, with privacy
+      // as the fallback: an unrecognised negative index must not fall through into the
+      // page's rows, where Enter stores a preset.
+      compare(root.headerActionAt(root.headerPrivacyIndex), "privacy")
+      compare(root.headerActionAt(root.headerPreviewIndex), "preview")
+      compare(root.headerActionAt(-99), "privacy")
     }
   }
 }

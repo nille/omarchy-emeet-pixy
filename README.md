@@ -22,8 +22,8 @@ widget that looks and behaves like the first-party ones.
   back from the hardware — so the panel is right even after another app moved the camera. Three presets
   save and recall a framing.
 - **A live preview, pinned above everything.** Full panel width, started when you open the panel and
-  stopped when you close it or the lens, or for good from the switch on FRAME. It sits outside the
-  scrolling area, so no page can scroll it away — the picture is the point of half these settings, and
+  stopped when you close it or the lens, or for good from the switch pinned just above it. It sits
+  outside the scrolling area, so no page can scroll it away — the picture is the point of half these settings, and
   it stays visible while you change them.
 - **Microphone, too.** Mute, volume, and a live level meter for the camera's own mic — on a call it is
   usually the mic in use, so muting it belongs next to closing the lens rather than two panels away.
@@ -103,7 +103,7 @@ the standard library.
 | `refreshIntervalSec` | `10` | How often to re-read camera state while the panel is open. |
 | `ptzStep` | `5` | How far one jog-pad press or slider step moves the camera, in degrees. |
 | `hideWhenAbsent` | `false` | Remove the bar icon when no camera is found, instead of showing a dimmed one. |
-| `preview` | `true` | Show a live video preview in the panel. The switch on the FRAME tab writes this same setting. See [The preview and other apps](#the-preview-and-other-apps). |
+| `preview` | `true` | Show a live video preview in the panel. The switch above the preview writes this same setting. See [The preview and other apps](#the-preview-and-other-apps). |
 | `callOpenLens` | `false` | Open the lens when another app starts using the camera, and close it again after. |
 | `callTracking` | `false` | Switch to AI tracking for the duration of a call, then restore the previous mode. |
 | `callUnmute` | `false` | Unmute the camera's microphone when a call starts — only if it was muted. |
@@ -128,7 +128,8 @@ omarchy bar set nille.emeet-pixy callOpenLens true --json
 
 ### The four tabs
 
-The panel is a privacy switch, a tab bar and the preview — all three pinned — over one page at a time:
+The panel is a privacy switch, a tab bar, a preview switch and the preview itself — all pinned — over
+one page at a time:
 
 | Tab | What is on it |
 | --- | --- |
@@ -150,10 +151,10 @@ picture with it. That is the reason for the split.
 | Scroll the icon | Zoom |
 | Privacy switch | Close or open the lens |
 | Click a tab | Switch pages |
+| Switch above the preview | Turn the preview off or on |
 | The preview | Recenter |
 | Standard / Tracking chips | Set the control mode (dimmed unless the camera is in use) |
 | Jog pad arrows, or its center | Pan and tilt, or recenter |
-| Switch on the FRAMING header, on FRAME | Turn the preview off or on |
 | Save on a preset row | Store the current framing |
 | Click a filled preset row, or its `×` | Recall it, or clear it |
 | Drag an image slider | Any control on the IMAGE tab |
@@ -413,10 +414,9 @@ first.
 
 ### Turning the preview off
 
-Flip the switch next to the eye on the **FRAMING** header, on the FRAME tab, and the frame collapses;
-every control keeps
-working. Or press `v`, or bind `previewOff` to a key, or set it from the CLI — all of them write the
-same persistent `preview` setting:
+Flip the **PREVIEW** switch directly above the picture — it is pinned there, so it is on every tab —
+and the frame collapses; every control keeps working. Or press `v`, or bind `previewOff` to a key, or
+set it from the CLI — all of them write the same persistent `preview` setting:
 
 ```bash
 omarchy bar set nille.emeet-pixy preview false --json
@@ -551,7 +551,7 @@ matched on file contents rather than process name, so unrelated Python programs 
 - `docs/PROTOCOL.md` — the wire protocol, what was verified against hardware, and why several of the
   camera's features are unused
 - `tests/test_pixy.py` — 396 unit tests over the helper
-- `tests/qml/` — 263 QML tests: input routing, cursor arithmetic, and the `Model.js` functions that
+- `tests/qml/` — 264 QML tests: input routing, cursor arithmetic, and the `Model.js` functions that
   need a JS engine rather than Python — including each tab's row order, which tabs a given camera
   earns, and the call automation's restore round trip
 - `tests/harness/shell.qml` — standalone window for developing the panel without a running Omarchy
