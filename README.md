@@ -81,7 +81,9 @@ sudo rm -f /etc/udev/rules.d/70-emeet-pixy.rules
 
 No daemon, no unit file. Two things live outside the plugin directory: its entry in
 `~/.config/omarchy/shell.json`, removed by `plugin remove`, and your presets in
-`~/.local/state/omarchy-emeet-pixy/presets.json`, to delete by hand. Privacy mode lives in the
+`~/.local/state/omarchy-emeet-pixy/presets.json`, to delete by hand. `plugin remove` also keeps a
+timestamped copy of the plugin directory beside it as `.nille.emeet-pixy.bak.<stamp>`, which is
+Omarchy's doing rather than this plugin's — delete it once you are sure. Privacy mode lives in the
 camera, not here — uninstall with the lens closed and it stays closed.
 
 ### Requirements
