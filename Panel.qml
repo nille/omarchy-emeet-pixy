@@ -1800,9 +1800,14 @@ Panel {
     // above the pages. Measured so FRAME fits under it exactly — that is the page
     // aiming happens on, and a jog pad you have to scroll to reach is the whole
     // problem this restructure was about.
+    //
+    // 920 was that measurement before the preview switch was pinned above the
+    // picture; the row it added pushed FRAME's hint line out of the card, which is
+    // the same invariant failing quietly rather than a new one. Raised by the row's
+    // own height so the measurement means what the paragraph above says again.
     contentHeight: panel.fittedContentHeight(
       pinnedColumn.implicitHeight + Style.spacing.panelGap + panelColumn.implicitHeight,
-      Style.space(920))
+      Style.space(920) + previewRow.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
