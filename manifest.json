@@ -64,7 +64,7 @@
         "type": "boolean",
         "label": "Show video preview",
         "defaultValue": true,
-        "description": "Show a small live preview while the panel is open. Only one app can capture at a time, so the preview yields automatically to any app already using the camera. Turn it off to keep the camera free for other apps entirely. The switch on the panel's FRAMING header sets this same value, so either place works."
+        "description": "Show a small live preview while the panel is open. Only one app can capture at a time, so the preview yields automatically to any app already using the camera. Turn it off to keep the camera free for other apps entirely. The switch pinned above the panel's preview sets this same value, so either place works."
       },
       {
         "key": "callOpenLens",
