@@ -53,7 +53,7 @@ Panel {
   // setting. Absent stays dimmed, which is a real degradation.
   readonly property color barIconColor: {
     var base = bar ? bar.barForeground : Color.foreground
-    return present ? base : Qt.darker(base, 1.55)
+    return present && privacy !== null ? base : Qt.darker(base, 1.55)
   }
 
   // ---------------------------------------------------------------- state
@@ -65,7 +65,7 @@ Panel {
   property bool everLoaded: false
 
   readonly property bool present: camera.present
-  readonly property bool privacy: camera.privacy
+  readonly property var privacy: camera.privacy
   readonly property var presets: camera.presets
 
   readonly property int refreshIntervalSec: Math.max(2, Math.min(3600, Number(setting("refreshIntervalSec", 10)) || 10))
@@ -1914,7 +1914,7 @@ Panel {
             Text {
               text: Model.barIcon(root.camera)
               // Same reasoning as barIconColor: the glyph carries the state.
-              color: root.foreground
+              color: root.privacy === null ? root.dim : root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.display
             }
@@ -1925,19 +1925,21 @@ Panel {
           trailingControl: Component {
             ToggleSwitch {
               id: privacySwitch
-              checked: root.privacy
+              checked: root.privacy === true
               hasCursor: root.privacyHasCursor
               foreground: root.foreground
               // Privacy reads as an alert state, not a neutral preference.
               accent: root.urgent
               enabled: root.present
-              opacity: enabled ? 1.0 : 0.4
+              opacity: enabled ? (root.privacy === null ? 0.6 : 1.0) : 0.4
               onHovered: function(on) { if (on) root.setHeaderCursor(root.headerPrivacyIndex) }
               onToggled: root.togglePrivacy()
 
               PanelToolTip {
                 visible: privacySwitch.containsMouse
-                text: root.privacy ? "Open the lens" : "Close the lens"
+                text: root.privacy === true
+                  ? "Open the lens"
+                  : (root.privacy === null ? "Privacy unknown — close the lens" : "Close the lens")
                 fontFamily: root.fontFamily
               }
             }
@@ -2174,7 +2176,7 @@ Panel {
 
               Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: root.privacy ? "󱜷" : "󰖠"
+                text: Model.barIcon(root.camera)
                 color: root.faint
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.iconLarge

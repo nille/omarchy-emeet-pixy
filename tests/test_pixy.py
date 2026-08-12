@@ -1732,6 +1732,7 @@ class CommandContractTests(unittest.TestCase):
              mock.patch.object(pixy, "capability", return_value=None):
             result = self.assert_json(pixy.cmd_state(args_for(["state"])))
         self.assertIsNone(result["mode"])
+        self.assertIsNone(result["privacy"])
         self.assertEqual(result["modeUnknown"], "no-hid")
 
     def test_state_marks_privacy_separately_from_mode(self):
@@ -1768,6 +1769,7 @@ class CommandContractTests(unittest.TestCase):
              mock.patch.object(pixy, "capability", return_value=None):
             result = self.assert_json(pixy.cmd_state(args_for(["state"])))
         self.assertEqual(result["modeUnknown"], "no-response")
+        self.assertIsNone(result["privacy"])
 
     def test_state_names_who_holds_the_stream(self):
         cam = FakeCamera(values={pixy.CID_ZOOM_ABSOLUTE: 100}, specs=ptz_specs())
@@ -1838,6 +1840,7 @@ class CommandContractTests(unittest.TestCase):
              mock.patch.object(pixy, "capability", return_value=None):
             result = self.assert_json(pixy.cmd_state(args_for(["state"])))
         self.assertEqual(result["modeUnknown"], "hid-error")
+        self.assertIsNone(result["privacy"])
         self.assertIn("udev", result["hidError"])
 
     def test_holders_reports_the_same_fields_as_state(self):

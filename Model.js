@@ -70,7 +70,9 @@ function parseState(raw) {
     modeUnknown: String(data.modeUnknown || ""),
     // Privacy is knowable even when the mode is not, so it is carried
     // separately rather than derived from `mode`.
-    privacy: data.privacy === true || String(data.mode) === "privacy",
+    privacy: data.privacy === true || String(data.mode) === "privacy"
+      ? true
+      : (data.privacy === false ? false : null),
     pan: clampPan(data.pan),
     tilt: clampTilt(data.tilt),
     zoom: clampZoom(data.zoom === undefined ? ZOOM_MIN : data.zoom),
@@ -93,7 +95,7 @@ function absentState(error) {
     streamUsers: [],
     mode: null,
     modeUnknown: "",
-    privacy: false,
+    privacy: null,
     pan: 0,
     tilt: 0,
     zoom: ZOOM_MIN,
@@ -174,6 +176,7 @@ function presetLabel(presets, slot) {
 // present in the Nerd Font by glyph name rather than by eyeballing the shape.
 function barIcon(state) {
   if (!state || !state.present) return "󰖠"
+  if (state.privacy !== true && state.privacy !== false) return "?"
   return state.privacy ? "󱜷" : "󰖠"
 }
 
@@ -187,6 +190,7 @@ function modeName(mode) {
 // One-line summary for the panel hero and the bar tooltip.
 function summary(state) {
   if (!state || !state.present) return "No camera found"
+  if (state.privacy !== true && state.privacy !== false) return "Privacy unknown"
   if (state.privacy) return "Privacy — lens closed"
   if (state.mode) return modeName(state.mode)
   // Standard and Tracking are indistinguishable on an idle camera. Saying so

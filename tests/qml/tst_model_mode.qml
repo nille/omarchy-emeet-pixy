@@ -117,6 +117,25 @@ Item {
               "The camera is not answering control queries.")
     }
 
+    function test_the_state_parser_preserves_unknown_privacy() {
+      var state = Model.parseState(JSON.stringify({
+        ok: true, present: true, mode: null, modeUnknown: "no-response"
+      }))
+      compare(state.privacy, null)
+    }
+
+    function test_unknown_privacy_has_distinct_text_and_glyph() {
+      var state = cam({ privacy: null, mode: null, modeUnknown: "no-response" })
+      compare(Model.summary(state), "Privacy unknown")
+      verify(Model.barIcon(state) !== Model.barIcon(cam({ privacy: false })))
+      verify(Model.barIcon(state) !== Model.barIcon(cam({ privacy: true })))
+    }
+
+    function test_confirmed_privacy_values_keep_their_glyphs() {
+      compare(Model.barIcon(cam({ privacy: false })), "󰖠")
+      compare(Model.barIcon(cam({ privacy: true })), "󱜷")
+    }
+
     function test_an_absent_camera_says_nothing_here() {
       // The panel hides this whole section without a camera; the hero line
       // already says there is none.
