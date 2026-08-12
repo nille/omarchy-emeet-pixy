@@ -1607,7 +1607,8 @@ Panel {
     onTriggered: root.flushImage()
   }
 
-  // Poll for other apps while — and only while — our preview holds the stream.
+  // Poll for other apps while our preview holds the stream, or while call
+  // automation needs start/end edges even with the popout closed.
   //
   // This is a latency fix, not a second refresh. The full `state` call costs
   // ~780 ms, almost all of it the HID mode query and its settle sleeps, so it
@@ -1617,14 +1618,15 @@ Panel {
   // yielding. `holders` costs ~55 ms and answers exactly the question that needs
   // answering quickly.
   //
-  // It stops once the preview is down, which makes yielding fast and re-acquiring
-  // slow. That asymmetry is deliberate: being late to get out of the way costs
-  // someone their video, while being late to resume our own thumbnail costs a few
-  // seconds of a placeholder. Only the expensive mistake is worth polling for.
+  // Without automation it stops once the preview is down, which makes yielding
+  // fast and re-acquiring slow. With automation enabled it stays on independently
+  // of panel visibility, and a pending restore keeps it alive if the setting is
+  // turned off during a call.
   Timer {
     interval: 1500
     repeat: true
-    running: root.opened && root.previewWanted
+    running: Model.shouldPollHolders(root.opened, root.previewWanted,
+                                     root.callAutomation, root.callRestore !== null)
     onTriggered: if (!holdersProc.running) {
       holdersProc.command = Model.holdersArgs(root.helper)
       holdersProc.running = true

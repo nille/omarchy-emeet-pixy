@@ -314,6 +314,17 @@ function callEdge(wasStreaming, isStreaming) {
   return ""
 }
 
+// Whether the cheap holders poll has work to do.
+//
+// The preview needs it only while it owns the stream, so another app can make it
+// yield quickly. Call automation needs it for a different reason: call edges
+// have to be observed even while the popout is closed. Keep polling after the
+// settings are disabled when a restore is still pending, or the end edge would
+// never arrive and the state changed at call start would be left behind.
+function shouldPollHolders(opened, previewWanted, automationEnabled, restorePending) {
+  return (!!opened && !!previewWanted) || !!automationEnabled || !!restorePending
+}
+
 // What to do about a call starting, given which actions are enabled and what the
 // camera is currently doing.
 //

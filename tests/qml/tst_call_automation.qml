@@ -70,6 +70,23 @@ Item {
       compare(Model.callEdge(true, true), "")
     }
 
+    function test_a_closed_panel_polls_when_call_automation_is_enabled() {
+      verify(Model.shouldPollHolders(false, false, true, false))
+    }
+
+    function test_a_pending_restore_keeps_polling_after_automation_is_disabled() {
+      verify(Model.shouldPollHolders(false, false, false, true))
+    }
+
+    function test_a_closed_panel_with_no_automation_does_not_poll() {
+      verify(!Model.shouldPollHolders(false, false, false, false))
+    }
+
+    function test_an_open_preview_still_polls_without_automation() {
+      verify(Model.shouldPollHolders(true, true, false, false))
+      verify(!Model.shouldPollHolders(true, false, false, false))
+    }
+
     // ---- what a call start plans ----
 
     function test_all_three_actions_on_a_camera_that_needs_all_three() {
