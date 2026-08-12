@@ -371,6 +371,20 @@ function callEndPlan(restore) {
   return plan
 }
 
+// The one absolute mode a call plan needs.
+//
+// `pixy mode tracking` already performs Privacy -> Standard -> Tracking inside
+// one helper process. Collapsing the plan to its final target therefore makes
+// the whole transition one serialized hardware operation instead of trying to
+// order several detached processes in QML.
+function callModeTarget(plan) {
+  var change = plan || {}
+  if (change.privacy === true) return "privacy"
+  if (change.mode) return change.mode
+  if (change.privacy === false) return "standard"
+  return ""
+}
+
 // Whether a plan asks for anything at all, so the caller can skip the work and
 // the log line rather than writing an empty change.
 function planIsEmpty(plan) {
