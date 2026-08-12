@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "nille.emeet-pixy",
   "name": "EMEET PIXY",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "nille",
   "license": "MIT",
   "description": "EMEET PIXY webcam control: privacy, AI tracking, pan/tilt/zoom, microphone, image settings, framing presets, snapshots, and the camera's own firmware settings.",
