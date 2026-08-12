@@ -1771,6 +1771,37 @@ class CommandContractTests(unittest.TestCase):
         self.assertEqual(result["modeUnknown"], "no-response")
         self.assertIsNone(result["privacy"])
 
+    def test_state_ambiguous_byte_still_confirms_the_shutter_is_open(self):
+        # 0x03 resolves to no mode, but it is not silence: the camera answered,
+        # and privacy would have answered 0x02. So the shutter is known-open even
+        # though Standard and Tracking cannot be told apart.
+        self.assertIn(pixy.MODE_AMBIGUOUS, pixy.MODE_NOT_PRIVACY)
+        self.assertNotIn(pixy.MODE_VALUES["privacy"], pixy.MODE_NOT_PRIVACY)
+
+    def test_mode_write_with_a_silent_readback_reports_unknown_privacy(self):
+        # The write went out and the confirmation query got nothing back. That is
+        # not evidence the lens is open.
+        with mock.patch.object(pixy, "find_hidraw", return_value="/dev/hidrawTEST"), \
+             mock.patch.object(pixy, "find_video", return_value="/dev/videoTEST"), \
+             mock.patch.object(pixy, "stream_holders", return_value=([], [])), \
+             mock.patch.object(pixy, "write_reports", return_value=None), \
+             mock.patch.object(pixy, "read_mode", return_value=(None, None)), \
+             mock.patch.object(pixy.time, "sleep", return_value=None):
+            result = self.assert_json(pixy.cmd_mode(args_for(["mode", "standard"])))
+        self.assertIsNone(result["privacy"])
+        self.assertIsNone(result["mode"])
+        self.assertFalse(result["confirmed"])
+
+    def test_mode_write_on_an_idle_camera_reports_the_shutter_open(self):
+        with mock.patch.object(pixy, "find_hidraw", return_value="/dev/hidrawTEST"), \
+             mock.patch.object(pixy, "find_video", return_value="/dev/videoTEST"), \
+             mock.patch.object(pixy, "stream_holders", return_value=([], [])), \
+             mock.patch.object(pixy, "write_reports", return_value=None), \
+             mock.patch.object(pixy, "read_mode", return_value=(None, 0x03)), \
+             mock.patch.object(pixy.time, "sleep", return_value=None):
+            result = self.assert_json(pixy.cmd_mode(args_for(["mode", "standard"])))
+        self.assertFalse(result["privacy"])
+
     def test_state_names_who_holds_the_stream(self):
         cam = FakeCamera(values={pixy.CID_ZOOM_ABSOLUTE: 100}, specs=ptz_specs())
         with mock.patch.object(pixy, "find_video", return_value="/dev/videoTEST"), \

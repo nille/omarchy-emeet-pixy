@@ -283,6 +283,17 @@ GROUP_AUDIO = 0x05
 MODE_VALUES = {"standard": 0x00, "tracking": 0x01, "privacy": 0x02}
 MODE_NAMES = {value: name for name, value in MODE_VALUES.items()}
 
+# What an idle camera answers for *both* Standard and Tracking, so it resolves to
+# neither. Named because it means something specific and appears in more than one
+# decision: it cannot be mapped to a mode, but it is still positive evidence that
+# the shutter is open — privacy would have answered 0x02, which reads back
+# unambiguously whether or not anything holds the stream.
+MODE_AMBIGUOUS = 0x03
+
+# The raw values that establish an open shutter. Privacy is the only mode that
+# closes it, so anything the camera positively reports as not-privacy means open.
+MODE_NOT_PRIVACY = (MODE_VALUES["standard"], MODE_VALUES["tracking"], MODE_AMBIGUOUS)
+
 # The camera acknowledges a config write by answering the same command with this
 # byte where a value would be. It is an ack, not a state — reading it back as if
 # it were the new value is how you conclude a working write failed.
@@ -1636,11 +1647,14 @@ def read_state(include_presets: bool = True) -> dict:
                 view["modeUnknown"] = (
                     "needs-stream" if raw is not None else "no-response"
                 )
-            # Privacy is knowable at all times, so the bar glyph and the privacy
-            # toggle never have to fall back to a guess.
+            # Privacy is knowable whenever the camera answers at all, even when
+            # Standard and Tracking cannot be told apart — so this is decided from
+            # the raw byte rather than from `mode`, which is None for the ambiguous
+            # reply. A silent interface leaves the value at None: not answering is
+            # not evidence that the shutter is open.
             if raw == MODE_VALUES["privacy"]:
                 view["privacy"] = True
-            elif raw in (MODE_VALUES["standard"], MODE_VALUES["tracking"], 0x03):
+            elif raw in MODE_NOT_PRIVACY:
                 view["privacy"] = False
         except OSError as exc:
             view["mode"] = None
@@ -1835,9 +1849,11 @@ def cmd_mode(args) -> dict:
         "mode": confirmed,
         "modeRaw": raw,
         "confirmed": confirmed == mode,
+        # Same tri-state as `state`, from the same raw byte: a write whose readback
+        # went silent must not report the shutter as open.
         "privacy": (
             True if confirmed == "privacy"
-            else False if raw in (MODE_VALUES["standard"], MODE_VALUES["tracking"], 0x03)
+            else False if raw in MODE_NOT_PRIVACY
             else None
         ),
         "streaming": streaming,
