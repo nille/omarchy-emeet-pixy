@@ -266,6 +266,13 @@ point; `focusSpot 0.5 0.5` centres it. `snapshot` returns immediately and the fi
 `previewActive` to the camera fields. The last two differ: `preview` is the setting, `previewActive` is
 whether an image is on screen, so a preview enabled but blocked by another app reads `true` and `false`.
 
+`privacy` has three values, not two: `true` for a closed shutter, `false` for an open one, and `null`
+when the control interface could not be read at all — a timeout, a missing udev rule, or no vendor HID
+node. A script must test it with `=== true` rather than for truthiness, because `null` is falsy and
+would otherwise be read as a confirmed open lens, which is the one mistake worth avoiding here. `mode`
+is `null` in the same conditions, and also on an idle camera that cannot distinguish Standard from
+Tracking.
+
 It also reports the firmware settings — `audio`, `gesture`, `mirror`, `flip`, `autoRotate`, `focus`,
 `focusSpot`, `autoPrivacy`, `nativePresets` — plus `snapshot`, `snapshotBusy`, `callActions` and
 `callActive`. Those are read on demand rather than polled, so they are `null` until something asks;

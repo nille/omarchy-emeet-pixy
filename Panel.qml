@@ -51,6 +51,13 @@ Panel {
   // by color: the strike-through is unambiguous on its own, and a bar that turns
   // red for a state the user chose on purpose reads as a fault rather than a
   // setting. Absent stays dimmed, which is a real degradation.
+  //
+  // Unknown privacy is *not* dimmed, even though it is also a degradation: dim
+  // is already spoken for by "no camera", and reusing it would make an attached
+  // camera with an unreadable shutter indistinguishable from no camera at all.
+  // Unknown carries its own glyph instead, which is the same division of labor
+  // as privacy itself — shape says which state, color says whether the widget is
+  // live.
   readonly property color barIconColor: {
     var base = bar ? bar.barForeground : Color.foreground
     return present ? base : Qt.darker(base, 1.55)
@@ -65,7 +72,7 @@ Panel {
   property bool everLoaded: false
 
   readonly property bool present: camera.present
-  readonly property bool privacy: camera.privacy
+  readonly property var privacy: camera.privacy
   readonly property var presets: camera.presets
 
   readonly property int refreshIntervalSec: Math.max(2, Math.min(3600, Number(setting("refreshIntervalSec", 10)) || 10))
@@ -1909,7 +1916,9 @@ Panel {
           iconComponent: Component {
             Text {
               text: Model.barIcon(root.camera)
-              // Same reasoning as barIconColor: the glyph carries the state.
+              // Same reasoning as barIconColor, including for unknown: the glyph
+              // carries the state, so this stays at full strength and lets the
+              // question-mark glyph do the talking.
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.display
@@ -1921,19 +1930,30 @@ Panel {
           trailingControl: Component {
             ToggleSwitch {
               id: privacySwitch
-              checked: root.privacy
+              // Unknown shows as unchecked, because the switch has only two
+              // positions and "off" is the one that leaves closing the lens one
+              // click away. The half-opacity below is what says the position is
+              // not a reading, and the tooltip says it in words.
+              checked: root.privacy === true
               hasCursor: root.privacyHasCursor
               foreground: root.foreground
               // Privacy reads as an alert state, not a neutral preference.
               accent: root.urgent
               enabled: root.present
-              opacity: enabled ? 1.0 : 0.4
+              opacity: enabled ? (Model.privacyKnown(root.camera) ? 1.0 : 0.6) : 0.4
               onHovered: function(on) { if (on) root.setHeaderCursor(root.headerPrivacyIndex) }
               onToggled: root.togglePrivacy()
 
               PanelToolTip {
                 visible: privacySwitch.containsMouse
-                text: root.privacy ? "Open the lens" : "Close the lens"
+                // Unknown still offers closing, never opening: the helper's own
+                // toggle errs toward covering the lens when it cannot read the
+                // mode, so the label matches what the click will actually do.
+                text: root.privacy === true
+                  ? "Open the lens"
+                  : (Model.privacyKnown(root.camera)
+                      ? "Close the lens"
+                      : "Privacy unknown — close the lens")
                 fontFamily: root.fontFamily
               }
             }
@@ -2170,7 +2190,7 @@ Panel {
 
               Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: root.privacy ? "󱜷" : "󰖠"
+                text: Model.barIcon(root.camera)
                 color: root.faint
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.iconLarge
@@ -2346,8 +2366,13 @@ Panel {
                 // Privacy is not a chip: it is the hero switch, because it is
                 // the state you need to reach without reading the panel first.
                 // While privacy is on, neither chip is the truth, so none is
-                // selected rather than showing a stale one as current.
-                value: root.privacy ? "" : (root.camera.mode || "")
+                // selected rather than showing a stale one as current. An
+                // unreadable shutter is treated the same way for the same reason:
+                // tested explicitly rather than leaning on null being falsy,
+                // which would read as confirmed-open.
+                value: Model.privacyKnown(root.camera) && !root.privacy
+                  ? (root.camera.mode || "")
+                  : ""
                 foreground: root.foreground
                 accent: root.accent
                 background: root.bar ? root.bar.background : Color.background
