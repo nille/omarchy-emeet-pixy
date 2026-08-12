@@ -1,0 +1,76 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base
+
+    steps:
+      - name: Install the test runtime
+        run: pacman -Syu --noconfirm git python qt6-declarative
+
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Run the Python suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/python-tests.log"
+
+          python3 -m unittest discover -s tests 2>&1 | tee "$log"
+
+          # Discovery behavior varies between Python releases, so the reported
+          # total is part of the test contract rather than decoration.
+          count="$(
+            awk '/^Ran [0-9]+ tests? in / { count = $2 }
+                 END { if (count != "") print count }' "$log"
+          )"
+          if [[ ! "$count" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Python unittest discovery did not report a positive test count."
+            exit 1
+          fi
+          echo "Python discovered $count tests."
+
+      - name: Run the QML suite with Qt 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner=/usr/lib/qt6/bin/qmltestrunner
+          log="$RUNNER_TEMP/qml-tests.log"
+
+          # Arch's unqualified qmltestrunner belongs to Qt 5 and can fail with
+          # no useful output. The literal Qt 6 path makes that mistake impossible.
+          if [[ ! -x "$runner" ]]; then
+            echo "::error::Qt 6 qmltestrunner is missing at $runner."
+            exit 1
+          fi
+
+          env -u DISPLAY -u WAYLAND_DISPLAY \
+            QT_QPA_PLATFORM=offscreen \
+            QT_QUICK_BACKEND=software \
+            QT_STYLE_OVERRIDE=Basic \
+            QT_QPA_PLATFORMTHEME= \
+            "$runner" -input tests/qml 2>&1 | tee "$log"
+
+          # A successful process is not enough: require the Qt test report to
+          # prove that it recorded at least one result.
+          count="$(
+            awk '/^Totals: [0-9]+ passed,/ { count = $2 }
+                 END { if (count != "") print count }' "$log"
+          )"
+          if [[ ! "$count" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::QML test discovery did not report a positive test count."
+            exit 1
+          fi
+          echo "QML discovered $count tests."
