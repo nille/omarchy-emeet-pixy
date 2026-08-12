@@ -371,19 +371,18 @@ function callEndPlan(restore) {
   return plan
 }
 
-// The ordered mode writes a call plan requires.
+// The one absolute mode a call plan needs.
 //
-// Privacy is a real mode on the wire. Leaving it must happen before a
-// Standard/Tracking write, while entering it must happen after. Returning one
-// list lets the panel feed a single serialized queue rather than relying on the
-// scheduling order of detached helper processes.
-function callModeSequence(plan) {
+// `pixy mode tracking` already performs Privacy -> Standard -> Tracking inside
+// one helper process. Collapsing the plan to its final target therefore makes
+// the whole transition one serialized hardware operation instead of trying to
+// order several detached processes in QML.
+function callModeTarget(plan) {
   var change = plan || {}
-  var out = []
-  if (change.privacy === false) out.push("standard")
-  if (change.mode && out[out.length - 1] !== change.mode) out.push(change.mode)
-  if (change.privacy === true && out[out.length - 1] !== "privacy") out.push("privacy")
-  return out
+  if (change.privacy === true) return "privacy"
+  if (change.mode) return change.mode
+  if (change.privacy === false) return "standard"
+  return ""
 }
 
 // Whether a plan asks for anything at all, so the caller can skip the work and

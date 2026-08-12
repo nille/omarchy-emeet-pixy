@@ -578,16 +578,13 @@ Panel {
   }
 
   // Applies a plan through the panel's ordinary paths, so automation cannot do
-  // anything a click cannot.
-  //
-  // Order matters and it is the order below. Leaving privacy comes before the mode
-  // write because the firmware ignores Standard/Tracking from privacy; entering it
-  // comes after, for the same reason in reverse. `mode` is therefore written
-  // between the two directions of privacy, which is why they are separate branches
-  // rather than one call.
+  // anything a click cannot. Every plan has one final absolute mode. In
+  // particular, the helper implements `mode tracking` as the required
+  // Privacy -> Standard -> Tracking transaction inside one process, so QML must
+  // not split that ordered hardware operation across detached commands.
   function applyCallPlan(plan) {
-    var modes = Model.callModeSequence(plan)
-    for (var i = 0; i < modes.length; i++) setMode(modes[i])
+    var mode = Model.callModeTarget(plan)
+    if (mode) setMode(mode)
     if (plan.muted !== undefined) setMicMuted(plan.muted)
   }
 
@@ -1027,29 +1024,6 @@ Panel {
 
   // ---------------------------------------------------------------- actions
 
-  // Mode writes are ordered hardware transitions, not independent mutations.
-  // Keep them on one Process so Privacy -> Standard -> Tracking cannot be
-  // reordered by the scheduler. This queue also covers the manual privacy
-  // toggle, preventing a click from racing an automation transition.
-  property var modeQueue: []
-
-  function modeWrite(argv) {
-    if (modeProc.running) {
-      modeQueue = modeQueue.concat([argv])
-      return
-    }
-    modeProc.command = argv
-    modeProc.running = true
-    settleTimer.restart()
-  }
-
-  function drainModeQueue() {
-    if (!modeQueue.length) return
-    var argv = modeQueue[0]
-    modeQueue = modeQueue.slice(1)
-    Qt.callLater(function() { root.modeWrite(argv) })
-  }
-
   // Every mutation goes through one detached process. Fire-and-forget plus a
   // follow-up read is deliberate: a slider drag emits far more sets than round
   // trips we would want to await, and the refresh reconciles anyway.
@@ -1060,7 +1034,7 @@ Panel {
 
   function togglePrivacy() {
     if (!present) return
-    modeWrite(Model.privacyArgs(helper))
+    run(Model.privacyArgs(helper))
   }
 
   // Guarded in one place rather than at each caller, because there are four —
@@ -1079,7 +1053,7 @@ Panel {
   function setMode(mode) {
     if (!present) return
     if (mode !== "privacy" && !camera.privacy && !Model.modeWritable(camera)) return
-    modeWrite(Model.modeArgs(helper, mode))
+    run(Model.modeArgs(helper, mode))
   }
 
   // Pan and tilt travel together in one helper call, because they are one
@@ -1505,12 +1479,6 @@ Panel {
   }
 
   // ---------------------------------------------------------------- processes
-
-  Process {
-    id: modeProc
-    stdout: StdioCollector { waitForEnd: true }
-    onExited: root.drainModeQueue()
-  }
 
   Process {
     id: stateProc

@@ -15,12 +15,12 @@
 //   round trip rather than field by field, because the bug would be a field that
 //   goes missing between the two halves and each half looks right alone.
 //
-// The ordering inside applyCallPlan is not tested here — it is three lines of Panel
-// dispatch — but the reason for it is worth restating, because it is the kind of
-// thing a later tidy-up merges: the firmware ignores Standard/Tracking writes made
-// from privacy, so leaving privacy has to precede the mode write and entering it
-// has to follow. planIsEmpty and callActionLabel are covered because they are what
-// stop the panel announcing a call it did nothing about.
+// A call plan maps to at most one absolute mode command. The helper's command
+// contract test covers the integration boundary: `mode tracking` itself puts
+// Standard and then Tracking on the wire when leaving Privacy. The tests here pin
+// the QML half so it cannot regress to dispatching those as competing processes.
+// planIsEmpty and callActionLabel are covered because they are what stop the panel
+// announcing a call it did nothing about.
 //
 //   QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -input tests/qml
 import QtQuick
@@ -157,23 +157,27 @@ Item {
       compare(trip.end.mode, "privacy")
     }
 
-    function test_call_mode_writes_leave_privacy_before_enabling_tracking() {
-      compare(Model.callModeSequence({ privacy: false, mode: "tracking" }),
-              ["standard", "tracking"])
+    function test_opening_privacy_and_enabling_tracking_is_one_absolute_write() {
+      compare(Model.callModeTarget({ privacy: false, mode: "tracking" }),
+              "tracking")
     }
 
-    function test_call_mode_writes_restore_privacy_last() {
-      compare(Model.callModeSequence({ mode: "standard", privacy: true }),
-              ["standard", "privacy"])
+    function test_restoring_privacy_collapses_a_redundant_saved_mode() {
+      compare(Model.callModeTarget({ mode: "privacy", privacy: true }),
+              "privacy")
     }
 
-    function test_call_mode_writes_do_not_send_privacy_twice() {
-      compare(Model.callModeSequence({ mode: "privacy", privacy: true }),
-              ["privacy"])
+    function test_lens_open_only_maps_to_standard() {
+      compare(Model.callModeTarget({ privacy: false }), "standard")
     }
 
-    function test_a_plan_without_modes_has_no_mode_writes() {
-      compare(Model.callModeSequence({ muted: false }), [])
+    function test_explicit_modes_are_the_single_target() {
+      compare(Model.callModeTarget({ mode: "standard" }), "standard")
+      compare(Model.callModeTarget({ mode: "tracking" }), "tracking")
+    }
+
+    function test_a_plan_without_a_camera_change_has_no_mode_write() {
+      compare(Model.callModeTarget({ muted: false }), "")
     }
 
     function test_a_camera_that_needed_nothing_needs_nothing_undone() {
