@@ -2037,10 +2037,10 @@ class CommandContractTests(unittest.TestCase):
                     result = self.assert_json(pixy.cmd_mode(args_for(["mode", "standard"])))
                 self.assertIs(result["streaming"], expected)
 
-    def test_tracking_from_privacy_writes_standard_first(self):
-        # The firmware ignores a privacy -> tracking transition, so without the
-        # intermediate write the camera stays in privacy while the panel shows
-        # tracking.
+    def test_single_tracking_command_serializes_privacy_transition(self):
+        # Call automation dispatches one absolute `mode tracking` command. The
+        # helper owns the ordered hardware transaction, so this is the
+        # integration boundary that must put Standard on the wire first.
         sent = []
         with mock.patch.object(pixy, "find_hidraw", return_value="/dev/hidrawTEST"), \
              mock.patch.object(pixy, "find_video", return_value=None), \

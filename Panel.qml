@@ -578,17 +578,13 @@ Panel {
   }
 
   // Applies a plan through the panel's ordinary paths, so automation cannot do
-  // anything a click cannot.
-  //
-  // Order matters and it is the order below. Leaving privacy comes before the mode
-  // write because the firmware ignores Standard/Tracking from privacy; entering it
-  // comes after, for the same reason in reverse. `mode` is therefore written
-  // between the two directions of privacy, which is why they are separate branches
-  // rather than one call.
+  // anything a click cannot. Every plan has one final absolute mode. In
+  // particular, the helper implements `mode tracking` as the required
+  // Privacy -> Standard -> Tracking transaction inside one process, so QML must
+  // not split that ordered hardware operation across detached commands.
   function applyCallPlan(plan) {
-    if (plan.privacy === false) setMode("standard")
-    if (plan.mode) setMode(plan.mode)
-    if (plan.privacy === true) setMode("privacy")
+    var mode = Model.callModeTarget(plan)
+    if (mode) setMode(mode)
     if (plan.muted !== undefined) setMicMuted(plan.muted)
   }
 
