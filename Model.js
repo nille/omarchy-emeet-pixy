@@ -345,7 +345,7 @@ function callStartPlan(actions, now) {
   // to leave Privacy before it can enable Tracking, so only plan that transition
   // when opening the lens is itself enabled.
   if (opts.tracking && state.mode && state.mode !== "tracking"
-      && (!state.privacy || opts.openLens)) {
+      && (state.privacy === false || opts.openLens)) {
     plan.mode = "tracking"
     plan.restore.mode = state.mode
   }
