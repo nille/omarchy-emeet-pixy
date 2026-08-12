@@ -26,8 +26,25 @@
 import QtQuick
 import QtTest
 import "../../Model.js" as Model
+import "../.." as Pixy
 
 Item {
+  Pixy.CallSession {
+    id: session
+  }
+
+  SignalSpy {
+    id: snapshotSpy
+    target: session
+    signalName: "snapshotRequested"
+  }
+
+  SignalSpy {
+    id: planSpy
+    target: session
+    signalName: "planReady"
+  }
+
   // Everything enabled, since the actions are independent and each test turns off
   // what it is not about.
   function actions(props) {
@@ -52,6 +69,20 @@ Item {
 
   TestCase {
     name: "CallAutomation"
+
+    function init() {
+      session.enabled = false
+      session.present = false
+      session.actions = ({})
+      session.hasMic = false
+      session.muted = false
+      session.streaming = false
+      session.generation = 0
+      session.pendingToken = 0
+      session.restore = null
+      snapshotSpy.clear()
+      planSpy.clear()
+    }
 
     // ---- the edge ----
 
@@ -85,6 +116,101 @@ Item {
     function test_an_open_preview_still_polls_without_automation() {
       verify(Model.shouldPollHolders(true, true, false, false))
       verify(!Model.shouldPollHolders(true, false, false, false))
+    }
+
+    function test_a_closed_panel_start_waits_for_fresh_state_then_applies_once() {
+      session.enabled = true
+      session.present = true
+      session.actions = actions({})
+      session.hasMic = true
+      session.muted = true
+
+      // No panel-open event is involved: the holders observation is the edge.
+      session.observeStreaming(true)
+      compare(snapshotSpy.count, 1)
+      compare(planSpy.count, 0)
+
+      var token = snapshotSpy.signalArguments[0][0]
+      verify(session.acceptSnapshot(token, {
+        present: true, streaming: true, privacy: true, mode: "standard"
+      }))
+      compare(planSpy.count, 1)
+      var plan = planSpy.signalArguments[0][0]
+      compare(plan.privacy, false)
+      compare(plan.mode, "tracking")
+      compare(plan.muted, false)
+
+      // Republishing the same stream state cannot consume the edge twice.
+      session.observeStreaming(true)
+      compare(snapshotSpy.count, 1)
+      compare(planSpy.count, 1)
+    }
+
+    function test_a_closed_panel_end_restores_only_the_recorded_changes() {
+      session.enabled = true
+      session.present = true
+      session.actions = actions({ tracking: false, unmute: false })
+
+      session.observeStreaming(true)
+      var token = snapshotSpy.signalArguments[0][0]
+      verify(session.acceptSnapshot(token, {
+        present: true, streaming: true, privacy: true, mode: "privacy"
+      }))
+      compare(planSpy.count, 1)
+
+      session.observeStreaming(false)
+      compare(planSpy.count, 2)
+      var end = planSpy.signalArguments[1][0]
+      compare(end.privacy, true)
+      compare(end.mode, undefined)
+      compare(end.muted, undefined)
+      compare(session.restore, null)
+    }
+
+    function test_a_snapshot_returning_after_the_call_ended_is_ignored() {
+      session.enabled = true
+      session.present = true
+      session.actions = actions({})
+
+      session.observeStreaming(true)
+      var token = snapshotSpy.signalArguments[0][0]
+      session.observeStreaming(false)
+      verify(!session.acceptSnapshot(token, {
+        present: true, streaming: true, privacy: true, mode: "standard"
+      }))
+      compare(planSpy.count, 1) // the empty end plan only
+      verify(Model.planIsEmpty(planSpy.signalArguments[0][0]))
+      compare(session.restore, null)
+    }
+
+    function test_a_fresh_snapshot_that_says_the_call_ended_is_consumed() {
+      session.enabled = true
+      session.present = true
+      session.actions = actions({})
+
+      session.observeStreaming(true)
+      var token = snapshotSpy.signalArguments[0][0]
+      verify(!session.acceptSnapshot(token, {
+        present: true, streaming: false, privacy: true, mode: "standard"
+      }))
+      compare(session.pendingToken, 0)
+      compare(planSpy.count, 0)
+      compare(session.restore, null)
+    }
+
+    function test_disabling_automation_invalidates_a_pending_snapshot() {
+      session.enabled = true
+      session.present = true
+      session.actions = actions({})
+
+      session.observeStreaming(true)
+      var token = snapshotSpy.signalArguments[0][0]
+      session.enabled = false
+      compare(session.pendingToken, 0)
+      verify(!session.acceptSnapshot(token, {
+        present: true, streaming: true, privacy: true, mode: "standard"
+      }))
+      compare(planSpy.count, 0)
     }
 
     // ---- what a call start plans ----

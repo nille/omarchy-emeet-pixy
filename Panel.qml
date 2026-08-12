@@ -532,49 +532,34 @@ Panel {
     onTriggered: root.callPending = ({})
   }
 
-  // What the last call start changed, and therefore what its end should put back.
-  // Null when no call is in progress. Session-only on purpose: a shell restart
-  // mid-call has no way to know what the pre-call state was, and replaying a
-  // stale one would be worse than leaving the camera as the call left it.
-  property var callRestore: null
-
   // The line the panel shows about it, so automation is visible rather than
   // spooky — a camera that opens its own lens should say who did that.
   property string callNote: ""
 
-  // The edge detector. `camera.streaming` counts only *other* apps, which is what
-  // makes this work at all: the panel's own preview holds the stream too, and
-  // counting it would fire automation every time the popout opened.
-  //
-  // Driven off a watched copy rather than a Connections on the property, because
-  // both the full `state` read and the fast `holders` poll republish it and the
-  // edge has to be taken once per real change.
-  property bool wasStreaming: false
+  // What the active call changed, and therefore what its end should put back.
+  // Session-only on purpose: a shell restart mid-call has no trustworthy
+  // pre-call state to restore.
+  readonly property var callRestore: callSession.restore
 
-  onCameraChanged: {
-    var edge = Model.callEdge(wasStreaming, camera.streaming)
-    wasStreaming = camera.streaming
-    if (edge === "start") applyCallStart()
-    else if (edge === "end") applyCallEnd()
-  }
+  CallSession {
+    id: callSession
+    enabled: root.callAutomation
+    present: root.present
+    actions: root.callActions
+    hasMic: root.hasMic
+    muted: root.micMuted
 
-  function applyCallStart() {
-    if (!callAutomation || !present) return
-    var plan = Model.callStartPlan(callActions, {
-      privacy: privacy, mode: camera.mode, muted: hasMic ? micMuted : undefined
-    })
-    if (Model.planIsEmpty(plan)) return
-    callRestore = plan.restore
-    applyCallPlan(plan)
-    callNote = "Call started — " + Model.callActionLabel(plan)
-  }
-
-  function applyCallEnd() {
-    var plan = Model.callEndPlan(callRestore)
-    callRestore = null
-    if (Model.planIsEmpty(plan)) { callNote = ""; return }
-    applyCallPlan(plan)
-    callNote = "Call ended — " + Model.callActionLabel(plan)
+    onSnapshotRequested: function(token) { root.requestCallSnapshot(token) }
+    onPlanReady: function(plan, edge) {
+      if (Model.planIsEmpty(plan)) {
+        if (edge === "end") root.callNote = ""
+        return
+      }
+      root.applyCallPlan(plan)
+      root.callNote = edge === "start"
+        ? "Call started — " + Model.callActionLabel(plan)
+        : "Call ended — " + Model.callActionLabel(plan)
+    }
   }
 
   // Applies a plan through the panel's ordinary paths, so automation cannot do
@@ -1310,14 +1295,28 @@ Panel {
     clampCursor()
   }
 
-  function refresh() {
-    if (stateProc.running) { refreshQueued = true; return }
-    loading = true
+  property bool stateBusy: false
+  property bool stateAnswered: false
+  property int stateRunCallToken: 0
+  property int callStateQueuedToken: 0
+
+  function startStateRead(callToken) {
+    stateBusy = true
+    stateAnswered = false
+    stateRunCallToken = callToken || 0
+    if (!stateRunCallToken) loading = true
     stateProc.command = Model.stateArgs(helper)
     stateProc.running = true
+    if (stateRunCallToken) stateTimeout.restart()
+  }
+
+  function refresh() {
+    if (stateBusy) { refreshQueued = true; return }
+    startStateRead(0)
   }
 
   function publish(raw) {
+    stateAnswered = true
     var parsed = Model.parseState(raw)
     camera = parsed
     lastError = parsed.error || ""
@@ -1332,6 +1331,59 @@ Panel {
     }
     if (!zoomDebounce.running) pendingZoom = noPending
     clampCursor()
+    if (stateRunCallToken)
+      callSession.acceptSnapshot(stateRunCallToken, parsed)
+  }
+
+  // Only holders replies drive call edges. Full state reads update the panel but
+  // cannot create an edge when the popout opens or when a mutation settles.
+  function publishHolders(raw) {
+    var next = Model.mergeHolders(camera, raw)
+    camera = next
+    callSession.observeStreaming(next.streaming)
+  }
+
+  // A call start needs current mode/privacy, not the idle snapshot left by the
+  // startup read. Queue a dedicated-purpose pass through the existing state
+  // process, so it is fresh without overlapping another HID query. Full state
+  // publication is safe here because only holders replies feed the edge detector.
+  function requestCallSnapshot(token) {
+    if (stateBusy) {
+      callStateQueuedToken = token
+      return
+    }
+    startStateRead(token)
+  }
+
+  function finishStateRead(exitCode) {
+    if (!stateBusy) return
+    var token = stateRunCallToken
+    stateTimeout.stop()
+    stateBusy = false
+    stateRunCallToken = 0
+    loading = false
+    if (token && !stateAnswered) callSession.rejectSnapshot(token)
+
+    // The helper always prints JSON and exits 0, even with no camera. A
+    // nonzero exit therefore means it could not run at all, and publish() never
+    // fired — so say so instead of showing a blank panel.
+    if (exitCode !== 0 && !everLoaded) {
+      camera = Model.parseState("")
+      lastError = "helper not runnable — chmod +x scripts/pixy"
+      everLoaded = true
+    }
+
+    var queued = callStateQueuedToken
+    callStateQueuedToken = 0
+    if (queued && (queued !== callSession.pendingToken || !callSession.streaming))
+      queued = 0
+
+    if (queued) {
+      Qt.callLater(function() { root.startStateRead(queued) })
+    } else if (refreshQueued) {
+      refreshQueued = false
+      Qt.callLater(function() { root.refresh() })
+    }
   }
 
   // ---------------------------------------------------------------- IPC
@@ -1490,23 +1542,14 @@ Panel {
       waitForEnd: true
       onStreamFinished: root.publish(text)
     }
-    onExited: function(exitCode) {
-      // The helper always prints JSON and exits 0, even with no camera. A
-      // nonzero exit therefore means it could not run at all, and publish()
-      // never fired — so say so instead of showing a blank panel.
-      if (exitCode !== 0 && !root.everLoaded) {
-        root.camera = Model.parseState("")
-        root.lastError = "helper not runnable — chmod +x scripts/pixy"
-        root.everLoaded = true
-      }
-    }
+    onExited: function(exitCode) { root.finishStateRead(exitCode) }
     onRunningChanged: {
-      if (running) return
-      root.loading = false
-      if (root.refreshQueued) {
-        root.refreshQueued = false
-        Qt.callLater(function() { root.refresh() })
-      }
+      if (running || !root.stateBusy) return
+      // A process that cannot be spawned never emits onExited. Defer one turn
+      // so a normal exit can publish its final stdout first.
+      Qt.callLater(function() {
+        if (root.stateBusy && !stateProc.running) root.finishStateRead(-1)
+      })
     }
   }
 
@@ -1516,7 +1559,7 @@ Panel {
     id: holdersProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.camera = Model.mergeHolders(root.camera, text)
+      onStreamFinished: root.publishHolders(text)
     }
   }
 
@@ -1623,10 +1666,23 @@ Panel {
   // of panel visibility, and a pending restore keeps it alive if the setting is
   // turned off during a call.
   Timer {
+    id: stateTimeout
+    interval: 5000
+    onTriggered: {
+      stateProc.running = false
+      Qt.callLater(function() {
+        if (root.stateBusy && !stateProc.running) root.finishStateRead(-1)
+      })
+    }
+  }
+
+  Timer {
     interval: 1500
     repeat: true
     running: Model.shouldPollHolders(root.opened, root.previewWanted,
-                                     root.callAutomation, root.callRestore !== null)
+                                     root.callAutomation,
+                                     root.callRestore !== null
+                                       || callSession.pendingToken !== 0)
     onTriggered: if (!holdersProc.running) {
       holdersProc.command = Model.holdersArgs(root.helper)
       holdersProc.running = true
