@@ -23,6 +23,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from unittest import mock
@@ -1670,6 +1671,66 @@ class ProfileStoreTests(unittest.TestCase):
         os.makedirs(os.path.dirname(pixy.state_path()), exist_ok=True)
         with open(pixy.state_path(), "w", encoding="utf-8") as fh:
             json.dump(blob, fh)
+
+
+class ConcurrentStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"XDG_STATE_HOME": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def race(self, first, second):
+        first_writing = threading.Event()
+        release_first = threading.Event()
+        guard = threading.Lock()
+        first_call = [True]
+        original = pixy.write_store
+
+        def delayed_write(blob):
+            with guard:
+                delay = first_call[0]
+                first_call[0] = False
+            if delay:
+                first_writing.set()
+                if not release_first.wait(2):
+                    return False
+            return original(blob)
+
+        results = []
+        with mock.patch.object(pixy, "write_store", side_effect=delayed_write):
+            one = threading.Thread(target=lambda: results.append(first()))
+            two = threading.Thread(target=lambda: results.append(second()))
+            one.start()
+            self.assertTrue(first_writing.wait(2))
+            two.start()
+            # Give the second writer time to reach the lock. Without a lock it
+            # reads the old document and completes before the first is released.
+            threading.Event().wait(0.05)
+            release_first.set()
+            one.join(2)
+            two.join(2)
+        self.assertFalse(one.is_alive())
+        self.assertFalse(two.is_alive())
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result[0] for result in results))
+
+    def test_concurrent_preset_and_profile_updates_preserve_both(self):
+        self.race(
+            lambda: pixy.update_preset(1, {"pan": 10, "tilt": 5, "zoom": 120}),
+            lambda: pixy.update_profile("warm", {"brightness": 150}),
+        )
+        self.assertEqual(pixy.read_presets(),
+                         {1: {"pan": 10, "tilt": 5, "zoom": 120}})
+        self.assertEqual(pixy.read_profiles(), {"warm": {"brightness": 150}})
+
+    def test_concurrent_slot_updates_preserve_both_slots(self):
+        self.race(
+            lambda: pixy.update_preset(1, {"pan": 10, "tilt": 5, "zoom": 120}),
+            lambda: pixy.update_preset(2, {"pan": -20, "tilt": 0, "zoom": 130}),
+        )
+        self.assertEqual(set(pixy.read_presets()), {1, 2})
 
 
 # ---------------------------------------------------------------- commands
