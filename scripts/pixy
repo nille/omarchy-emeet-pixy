@@ -1145,14 +1145,30 @@ def update_store(mutator) -> bool:
     The lock covers the read as well as the write. Locking only `os.replace`
     would still let two helpers read the same old document and have the last one
     erase the other's update.
+
+    A mutator that returns False means "nothing to change": the document is left
+    exactly as it was found rather than rewritten identically. That matters
+    because writing normalizes, and normalizing drops keys this build does not
+    recognize — so a rewrite is never free on a store a newer build may have
+    written. Anything else, None included, writes.
+
+    The lock file is deliberately separate from the document, because the document
+    is replaced rather than written in place: locking it directly would leave each
+    writer holding a lock on an inode the next `os.replace` had already unlinked,
+    which is no lock at all.
     """
     path = state_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Never unlinked. A lock file that gets cleaned up can be recreated while
+        # another helper still holds the old inode, giving two writers separate
+        # locks and no mutual exclusion — so this one empty file outlives the
+        # process on purpose. Removing it is safe only at uninstall.
         with open(f"{path}.lock", "a+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             blob = read_store()
-            mutator(blob)
+            if mutator(blob) is False:
+                return True
             return write_store(blob)
     except OSError:
         return False
@@ -1191,16 +1207,30 @@ def preset_blob(slots: dict) -> dict:
 
 
 def write_presets(slots: dict) -> bool:
-    """Replace the framing presets, leaving image profiles as they were."""
+    """Replace the framing presets wholesale, leaving image profiles as they were.
+
+    Locked like every other write, but last-writer-wins *within* `slots` by
+    definition — it is given the whole mapping. The commands use `update_preset`
+    instead, which merges one slot into whatever the document holds now. Prefer
+    that for anything driven by a user action; this is for replacing the set.
+    """
     return update_store(lambda blob: blob.update({"slots": preset_blob(slots)}))
 
 
 def update_preset(slot: int, entry: dict | None) -> tuple[bool, dict]:
-    """Set or clear one slot against the latest document under the store lock."""
+    """Set or clear one slot against the latest document under the store lock.
+
+    Clearing an already-empty slot writes nothing, for the reason in
+    `update_profile`: a rewrite normalizes, and normalizing is only free on a
+    document this build wrote.
+    """
     latest = {}
 
-    def mutate(blob: dict) -> None:
+    def mutate(blob: dict):
         slots = clean_presets(blob.get("slots"))
+        if entry is None and slot not in slots:
+            latest.update(slots)
+            return False
         if entry is None:
             slots.pop(slot, None)
         else:
@@ -1247,19 +1277,33 @@ def profile_blob(profiles: dict) -> dict:
 
 
 def write_profiles(profiles: dict) -> bool:
-    """Replace the image profiles, leaving framing presets as they were."""
+    """Replace the image profiles wholesale, leaving framing presets as they were.
+
+    The `write_presets` counterpart, with the same caveat: use `update_profile`
+    for one named profile, and this only when replacing the whole set.
+    """
     return update_store(lambda blob: blob.update({"profiles": profile_blob(profiles)}))
 
 
 def update_profile(name: str, entry: dict | None) -> tuple[bool, bool, dict]:
-    """Set or clear one profile against the latest document under the lock."""
+    """Set or clear one profile against the latest document under the lock.
+
+    Clearing a name that is not there writes nothing at all. The obvious version
+    rewrites the document anyway, which looks harmless and is not: the rewrite
+    normalizes, so it would persist the pruning of every control a newer build
+    knows about and this one does not — turning a failed `profile clear` into the
+    downgrade data loss `clean_profiles` exists to avoid.
+    """
     latest = {}
     existed = [False]
 
-    def mutate(blob: dict) -> None:
+    def mutate(blob: dict):
         profiles = clean_profiles(blob.get("profiles"))
         existed[0] = name in profiles
         if entry is None:
+            if not existed[0]:
+                latest.update(profiles)
+                return False
             profiles.pop(name, None)
         else:
             profiles[name] = entry

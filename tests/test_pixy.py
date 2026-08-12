@@ -1732,6 +1732,53 @@ class ConcurrentStoreTests(unittest.TestCase):
         )
         self.assertEqual(set(pixy.read_presets()), {1, 2})
 
+    # A clear that finds nothing must not write. Writing normalizes, and
+    # normalizing drops what this build does not recognize — so a no-op clear
+    # would silently prune a newer build's keys. That is the exact loss
+    # clean_profiles is written to avoid, so it must not arrive by this door.
+    def clear_probe(self, action):
+        path = pixy.state_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "profiles": {"warm": {"brightness": 150, "unknownFutureKey": 7}},
+                "slots": {"1": {"pan": 1, "tilt": 2, "zoom": 100, "roll": 9}},
+                "somethingElseEntirely": {"kept": True},
+            }, fh)
+        with open(path, "rb") as fh:
+            before = fh.read()
+        result = action()
+        with open(path, "rb") as fh:
+            return before, fh.read(), result
+
+    def test_clearing_an_absent_profile_leaves_the_document_untouched(self):
+        before, after, (written, existed, _) = self.clear_probe(
+            lambda: pixy.update_profile("nope", None))
+        self.assertTrue(written)
+        self.assertFalse(existed)
+        self.assertEqual(before, after)
+
+    def test_clearing_an_empty_slot_leaves_the_document_untouched(self):
+        before, after, (written, _) = self.clear_probe(
+            lambda: pixy.update_preset(3, None))
+        self.assertTrue(written)
+        self.assertEqual(before, after)
+
+    def test_a_real_clear_still_writes(self):
+        before, after, (written, existed, profiles) = self.clear_probe(
+            lambda: pixy.update_profile("warm", None))
+        self.assertTrue(written)
+        self.assertTrue(existed)
+        self.assertNotEqual(before, after)
+        self.assertEqual(profiles, {})
+
+    def test_the_profile_clear_command_reports_a_missing_name(self):
+        self.clear_probe(lambda: None)
+        result = json.loads(json.dumps(pixy.cmd_profile(
+            args_for(["profile", "clear", "nope"]))))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "no such profile")
+
 
 # ---------------------------------------------------------------- commands
 
