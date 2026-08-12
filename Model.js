@@ -393,7 +393,11 @@ function callStartPlan(actions, now) {
   // Tracking only when the mode is known. An unknown mode means the camera would
   // not say whether it is already tracking, and restoring to a guess at the end
   // of the call is worse than not touching it — see the 0x03 ambiguity.
-  if (opts.tracking && state.mode && state.mode !== "tracking") {
+  // Tracking must not be an implicit way to uncover the camera. The helper has
+  // to leave Privacy before it can enable Tracking, so only plan that transition
+  // when opening the lens is itself enabled.
+  if (opts.tracking && state.mode && state.mode !== "tracking"
+      && (state.privacy === false || opts.openLens)) {
     plan.mode = "tracking"
     plan.restore.mode = state.mode
   }
