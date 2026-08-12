@@ -34,6 +34,30 @@ function clampZoom(value) { return Math.round(clamp(value, ZOOM_MIN, ZOOM_MAX)) 
 
 // ---------------------------------------------------------------- parsing
 
+// Whether the shutter state was actually established, as opposed to merely
+// absent from the reply.
+//
+// Privacy is a tri-state — true, false, or null for "the HID query never
+// answered" — and every consumer has to ask this question rather than testing
+// truthiness. `!state.privacy` would fold unknown in with confirmed-open, which
+// is precisely the bug this distinction exists to prevent, and it is the easy
+// mistake to make because null *is* falsy. Asked here once, by name.
+function privacyKnown(state) {
+  return !!state && (state.privacy === true || state.privacy === false)
+}
+
+// The shutter state a helper reply establishes: true, false, or null for "not
+// established". `mode === "privacy"` counts as confirmation on its own, because
+// 0x02 is unambiguous even on an idle camera — that is what lets the toggle work
+// when Standard and Tracking cannot be told apart. An older helper that predates
+// the explicit `privacy` field is therefore still read correctly.
+function parsePrivacy(data) {
+  if (!data) return null
+  if (data.privacy === true || String(data.mode) === "privacy") return true
+  if (data.privacy === false) return false
+  return null
+}
+
 // Parse a helper reply. Anything unexpected yields a shape the panel can render
 // without null checks, because a blank widget is worse than an honest
 // "no camera" state.
@@ -69,8 +93,10 @@ function parseState(raw) {
     mode: MODES.indexOf(String(data.mode)) >= 0 ? String(data.mode) : null,
     modeUnknown: String(data.modeUnknown || ""),
     // Privacy is knowable even when the mode is not, so it is carried
-    // separately rather than derived from `mode`.
-    privacy: data.privacy === true || String(data.mode) === "privacy",
+    // separately rather than derived from `mode`. Three outcomes, and the third
+    // is the point: a reply that carries no privacy value at all stays null
+    // instead of defaulting to "open".
+    privacy: parsePrivacy(data),
     pan: clampPan(data.pan),
     tilt: clampTilt(data.tilt),
     zoom: clampZoom(data.zoom === undefined ? ZOOM_MIN : data.zoom),
@@ -93,7 +119,7 @@ function absentState(error) {
     streamUsers: [],
     mode: null,
     modeUnknown: "",
-    privacy: false,
+    privacy: null,
     pan: 0,
     tilt: 0,
     zoom: ZOOM_MIN,
@@ -170,10 +196,17 @@ function presetLabel(presets, slot) {
 // a plain one. Deliberately not three glyphs for three modes — the bar is read
 // at a glance, and "is the lens closed" is the question being asked.
 //
-// Codepoints are md-webcam (U+F05A0) and md-webcam_off (U+F1737), verified
-// present in the Nerd Font by glyph name rather than by eyeballing the shape.
+// Codepoints are md-webcam (U+F05A0), md-webcam_off (U+F1737) and
+// md-help_circle_outline (U+F0625), verified present in the Nerd Font by glyph
+// name rather than by eyeballing the shape.
+//
+// Unknown gets a third glyph rather than borrowing either confirmed one. Reusing
+// the plain webcam would say "the lens is open" about a camera whose shutter
+// nobody has managed to read, which is the failure this whole distinction exists
+// to prevent.
 function barIcon(state) {
   if (!state || !state.present) return "󰖠"
+  if (!privacyKnown(state)) return "󰘥"
   return state.privacy ? "󱜷" : "󰖠"
 }
 
@@ -185,17 +218,36 @@ function modeName(mode) {
 }
 
 // One-line summary for the panel hero and the bar tooltip.
+//
+// Unknown privacy says so *and* says why. The reason is the actionable half:
+// "no control interface" is the one that means the udev rule is missing, and a
+// bare "Privacy unknown" would drop exactly the words that tell someone what to
+// fix. The two are joined rather than one replacing the other.
 function summary(state) {
   if (!state || !state.present) return "No camera found"
+  if (!privacyKnown(state)) {
+    var why = modeUnknownReason(state)
+    return why ? "Privacy unknown — " + why.toLowerCase() : "Privacy unknown"
+  }
   if (state.privacy) return "Privacy — lens closed"
   if (state.mode) return modeName(state.mode)
   // Standard and Tracking are indistinguishable on an idle camera. Saying so
   // beats picking one: the panel would otherwise claim tracking is off while
   // the camera is following someone around the room.
-  if (state.modeUnknown === "needs-stream") return "Ready"
+  return modeUnknownReason(state) || "Ready"
+}
+
+// Why the mode came back unknown, in words. Null when there is nothing to
+// explain — an idle camera is the ordinary case, not a fault.
+//
+// Split out of `summary` because unknown privacy needs the same three strings:
+// they are the only place the panel can say "check the udev rule" out loud.
+function modeUnknownReason(state) {
+  if (!state) return null
   if (state.modeUnknown === "no-response") return "Not responding"
   if (state.modeUnknown === "no-hid") return "No control interface"
-  return "Ready"
+  if (state.modeUnknown === "hid-error") return "Control interface error"
+  return null
 }
 
 // Chip label for one mode, prefixed with a filled or hollow radio dot.

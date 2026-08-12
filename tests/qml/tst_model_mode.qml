@@ -117,6 +117,74 @@ Item {
               "The camera is not answering control queries.")
     }
 
+    function test_the_state_parser_preserves_unknown_privacy() {
+      var state = Model.parseState(JSON.stringify({
+        ok: true, present: true, mode: null, modeUnknown: "no-response"
+      }))
+      compare(state.privacy, null)
+    }
+
+    function test_unknown_privacy_has_distinct_text_and_glyph() {
+      var state = cam({ privacy: null, mode: null, modeUnknown: "no-response" })
+      verify(Model.summary(state).indexOf("Privacy unknown") === 0)
+      verify(Model.barIcon(state) !== Model.barIcon(cam({ privacy: false })))
+      verify(Model.barIcon(state) !== Model.barIcon(cam({ privacy: true })))
+    }
+
+    function test_confirmed_privacy_values_keep_their_glyphs() {
+      compare(Model.barIcon(cam({ privacy: false })), "󰖠")
+      compare(Model.barIcon(cam({ privacy: true })), "󱜷")
+    }
+
+    function test_the_unknown_glyph_is_a_font_glyph_not_an_ascii_question_mark() {
+      // The bar is a run of Nerd Font glyphs. A literal "?" is the shape a
+      // missing glyph makes, so it would read as a font problem rather than as a
+      // camera state.
+      var icon = Model.barIcon(cam({ privacy: null, modeUnknown: "no-hid" }))
+      verify(icon !== "?")
+      verify(icon.charCodeAt(0) > 0xFF)
+    }
+
+    // Unknown privacy must not swallow the reason, which is the actionable half:
+    // "no control interface" is what tells someone to check the udev rule. These
+    // two strings were unreachable at one point, which is why they are pinned by
+    // name here rather than only through modeNote.
+    function test_unknown_privacy_still_says_why_it_is_unknown() {
+      compare(Model.summary(cam({ privacy: null, mode: null, modeUnknown: "no-hid" })),
+              "Privacy unknown — no control interface")
+      compare(Model.summary(cam({ privacy: null, mode: null, modeUnknown: "no-response" })),
+              "Privacy unknown — not responding")
+      compare(Model.summary(cam({ privacy: null, mode: null, modeUnknown: "hid-error" })),
+              "Privacy unknown — control interface error")
+    }
+
+    function test_a_readable_shutter_keeps_the_plain_diagnostics() {
+      // Privacy known, mode not: the old wording, still reachable.
+      compare(Model.summary(cam({ privacy: false, mode: null, modeUnknown: "no-response" })),
+              "Not responding")
+      compare(Model.summary(cam({ privacy: false, mode: null, modeUnknown: "no-hid" })),
+              "No control interface")
+      compare(Model.summary(cam({ privacy: false, mode: null, modeUnknown: "needs-stream" })),
+              "Ready")
+    }
+
+    function test_privacy_known_separates_unknown_from_confirmed_open() {
+      // null is falsy, so `!state.privacy` would fold these together — the exact
+      // bug the tri-state exists to prevent.
+      verify(Model.privacyKnown(cam({ privacy: false })))
+      verify(Model.privacyKnown(cam({ privacy: true })))
+      verify(!Model.privacyKnown(cam({ privacy: null })))
+      verify(!Model.privacyKnown(null))
+    }
+
+    function test_an_older_helper_reply_still_reads_privacy_from_the_mode() {
+      // No `privacy` key at all, as a helper predating the explicit field sends.
+      // 0x02 is unambiguous, so mode alone is enough to confirm it.
+      var state = Model.parseState(JSON.stringify({
+        ok: true, present: true, mode: "privacy" }))
+      compare(state.privacy, true)
+    }
+
     function test_an_absent_camera_says_nothing_here() {
       // The panel hides this whole section without a camera; the hero line
       // already says there is none.
