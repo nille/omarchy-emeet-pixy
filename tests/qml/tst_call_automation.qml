@@ -135,6 +135,32 @@ Item {
       compare(plan.muted, false)
     }
 
+    function test_tracking_alone_never_opens_a_private_camera() {
+      var plan = Model.callStartPlan(
+        actions({ openLens: false, tracking: true, unmute: false }),
+        now({ privacy: true, mode: "privacy", muted: false }))
+      verify(Model.planIsEmpty(plan))
+      compare(plan.privacy, undefined)
+      compare(plan.mode, undefined)
+    }
+
+    function test_tracking_can_follow_an_explicit_lens_open() {
+      var plan = Model.callStartPlan(
+        actions({ openLens: true, tracking: true, unmute: false }),
+        now({ privacy: true, mode: "privacy", muted: false }))
+      compare(plan.privacy, false)
+      compare(plan.mode, "tracking")
+      compare(plan.restore.privacy, true)
+    }
+
+    function test_tracking_does_not_treat_unknown_privacy_as_open() {
+      var plan = Model.callStartPlan(
+        actions({ openLens: false, tracking: true, unmute: false }),
+        now({ privacy: null, mode: "standard", muted: false }))
+      verify(Model.planIsEmpty(plan))
+      compare(plan.mode, undefined)
+    }
+
     function test_an_absent_state_object_plans_nothing_rather_than_crashing() {
       // The first `camera` publish can land before anything is known.
       verify(Model.planIsEmpty(Model.callStartPlan(actions({}), null)))
