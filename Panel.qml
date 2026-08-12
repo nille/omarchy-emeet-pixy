@@ -1297,12 +1297,14 @@ Panel {
 
   property bool stateBusy: false
   property bool stateAnswered: false
+  property bool stateCancelled: false
   property int stateRunCallToken: 0
   property int callStateQueuedToken: 0
 
   function startStateRead(callToken) {
     stateBusy = true
     stateAnswered = false
+    stateCancelled = false
     stateRunCallToken = callToken || 0
     if (!stateRunCallToken) loading = true
     stateProc.command = Model.stateArgs(helper)
@@ -1316,8 +1318,12 @@ Panel {
   }
 
   function publish(raw) {
+    var parsed = Model.parseStateReply(raw, stateCancelled)
+    if (parsed === null) {
+      if (stateRunCallToken) callSession.rejectSnapshot(stateRunCallToken)
+      return
+    }
     stateAnswered = true
-    var parsed = Model.parseState(raw)
     camera = parsed
     lastError = parsed.error || ""
     everLoaded = true
@@ -1669,6 +1675,7 @@ Panel {
     id: stateTimeout
     interval: 5000
     onTriggered: {
+      root.stateCancelled = true
       stateProc.running = false
       Qt.callLater(function() {
         if (root.stateBusy && !stateProc.running) root.finishStateRead(-1)

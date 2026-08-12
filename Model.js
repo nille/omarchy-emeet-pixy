@@ -80,6 +80,13 @@ function parseState(raw) {
   }
 }
 
+// A Process that is stopped deliberately still completes its stdout collector
+// with an empty string. That is not a device reply and must not be parsed as an
+// absent camera, or the cheap holders merge can no longer recover the state.
+function parseStateReply(raw, cancelled) {
+  return cancelled ? null : parseState(raw)
+}
+
 function absentState(error) {
   return {
     ok: false,

@@ -213,6 +213,43 @@ Item {
       compare(planSpy.count, 0)
     }
 
+    function test_cancelled_snapshot_output_preserves_presence_and_future_edges() {
+      session.enabled = true
+      session.present = true
+      session.actions = actions({})
+
+      session.observeStreaming(true)
+      var token = snapshotSpy.signalArguments[0][0]
+      var camera = Model.parseState(JSON.stringify({
+        ok: true, present: true, streaming: true,
+        privacy: true, mode: "standard"
+      }))
+
+      // Quickshell completes a cancelled Process collector with an empty
+      // string. Filtering that result is what keeps the camera out of the
+      // absent-state trap in mergeHolders().
+      var reply = Model.parseStateReply("", true)
+      compare(reply, null)
+      session.rejectSnapshot(token)
+      compare(camera.present, true)
+      compare(camera.streaming, true)
+      compare(session.streaming, true)
+      compare(planSpy.count, 0)
+
+      // The real end remains the end edge, and the next call is detected.
+      session.observeStreaming(false)
+      compare(planSpy.count, 1)
+      verify(Model.planIsEmpty(planSpy.signalArguments[0][0]))
+      session.observeStreaming(true)
+      compare(snapshotSpy.count, 2)
+    }
+
+    function test_uncancelled_empty_state_output_is_still_an_error() {
+      var reply = Model.parseStateReply("", false)
+      compare(reply.present, false)
+      compare(reply.error, "no output")
+    }
+
     // ---- what a call start plans ----
 
     function test_all_three_actions_on_a_camera_that_needs_all_three() {
