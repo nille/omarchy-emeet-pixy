@@ -23,6 +23,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from unittest import mock
@@ -1670,6 +1671,113 @@ class ProfileStoreTests(unittest.TestCase):
         os.makedirs(os.path.dirname(pixy.state_path()), exist_ok=True)
         with open(pixy.state_path(), "w", encoding="utf-8") as fh:
             json.dump(blob, fh)
+
+
+class ConcurrentStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"XDG_STATE_HOME": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def race(self, first, second):
+        first_writing = threading.Event()
+        release_first = threading.Event()
+        guard = threading.Lock()
+        first_call = [True]
+        original = pixy.write_store
+
+        def delayed_write(blob):
+            with guard:
+                delay = first_call[0]
+                first_call[0] = False
+            if delay:
+                first_writing.set()
+                if not release_first.wait(2):
+                    return False
+            return original(blob)
+
+        results = []
+        with mock.patch.object(pixy, "write_store", side_effect=delayed_write):
+            one = threading.Thread(target=lambda: results.append(first()))
+            two = threading.Thread(target=lambda: results.append(second()))
+            one.start()
+            self.assertTrue(first_writing.wait(2))
+            two.start()
+            # Give the second writer time to reach the lock. Without a lock it
+            # reads the old document and completes before the first is released.
+            threading.Event().wait(0.05)
+            release_first.set()
+            one.join(2)
+            two.join(2)
+        self.assertFalse(one.is_alive())
+        self.assertFalse(two.is_alive())
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result[0] for result in results))
+
+    def test_concurrent_preset_and_profile_updates_preserve_both(self):
+        self.race(
+            lambda: pixy.update_preset(1, {"pan": 10, "tilt": 5, "zoom": 120}),
+            lambda: pixy.update_profile("warm", {"brightness": 150}),
+        )
+        self.assertEqual(pixy.read_presets(),
+                         {1: {"pan": 10, "tilt": 5, "zoom": 120}})
+        self.assertEqual(pixy.read_profiles(), {"warm": {"brightness": 150}})
+
+    def test_concurrent_slot_updates_preserve_both_slots(self):
+        self.race(
+            lambda: pixy.update_preset(1, {"pan": 10, "tilt": 5, "zoom": 120}),
+            lambda: pixy.update_preset(2, {"pan": -20, "tilt": 0, "zoom": 130}),
+        )
+        self.assertEqual(set(pixy.read_presets()), {1, 2})
+
+    # A clear that finds nothing must not write. Writing normalizes, and
+    # normalizing drops what this build does not recognize — so a no-op clear
+    # would silently prune a newer build's keys. That is the exact loss
+    # clean_profiles is written to avoid, so it must not arrive by this door.
+    def clear_probe(self, action):
+        path = pixy.state_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "profiles": {"warm": {"brightness": 150, "unknownFutureKey": 7}},
+                "slots": {"1": {"pan": 1, "tilt": 2, "zoom": 100, "roll": 9}},
+                "somethingElseEntirely": {"kept": True},
+            }, fh)
+        with open(path, "rb") as fh:
+            before = fh.read()
+        result = action()
+        with open(path, "rb") as fh:
+            return before, fh.read(), result
+
+    def test_clearing_an_absent_profile_leaves_the_document_untouched(self):
+        before, after, (written, existed, _) = self.clear_probe(
+            lambda: pixy.update_profile("nope", None))
+        self.assertTrue(written)
+        self.assertFalse(existed)
+        self.assertEqual(before, after)
+
+    def test_clearing_an_empty_slot_leaves_the_document_untouched(self):
+        before, after, (written, _) = self.clear_probe(
+            lambda: pixy.update_preset(3, None))
+        self.assertTrue(written)
+        self.assertEqual(before, after)
+
+    def test_a_real_clear_still_writes(self):
+        before, after, (written, existed, profiles) = self.clear_probe(
+            lambda: pixy.update_profile("warm", None))
+        self.assertTrue(written)
+        self.assertTrue(existed)
+        self.assertNotEqual(before, after)
+        self.assertEqual(profiles, {})
+
+    def test_the_profile_clear_command_reports_a_missing_name(self):
+        self.clear_probe(lambda: None)
+        result = json.loads(json.dumps(pixy.cmd_profile(
+            args_for(["profile", "clear", "nope"]))))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "no such profile")
 
 
 # ---------------------------------------------------------------- commands
