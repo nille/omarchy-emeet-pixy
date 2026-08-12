@@ -371,6 +371,21 @@ function callEndPlan(restore) {
   return plan
 }
 
+// The ordered mode writes a call plan requires.
+//
+// Privacy is a real mode on the wire. Leaving it must happen before a
+// Standard/Tracking write, while entering it must happen after. Returning one
+// list lets the panel feed a single serialized queue rather than relying on the
+// scheduling order of detached helper processes.
+function callModeSequence(plan) {
+  var change = plan || {}
+  var out = []
+  if (change.privacy === false) out.push("standard")
+  if (change.mode && out[out.length - 1] !== change.mode) out.push(change.mode)
+  if (change.privacy === true && out[out.length - 1] !== "privacy") out.push("privacy")
+  return out
+}
+
 // Whether a plan asks for anything at all, so the caller can skip the work and
 // the log line rather than writing an empty change.
 function planIsEmpty(plan) {

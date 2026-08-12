@@ -157,6 +157,25 @@ Item {
       compare(trip.end.mode, "privacy")
     }
 
+    function test_call_mode_writes_leave_privacy_before_enabling_tracking() {
+      compare(Model.callModeSequence({ privacy: false, mode: "tracking" }),
+              ["standard", "tracking"])
+    }
+
+    function test_call_mode_writes_restore_privacy_last() {
+      compare(Model.callModeSequence({ mode: "standard", privacy: true }),
+              ["standard", "privacy"])
+    }
+
+    function test_call_mode_writes_do_not_send_privacy_twice() {
+      compare(Model.callModeSequence({ mode: "privacy", privacy: true }),
+              ["privacy"])
+    }
+
+    function test_a_plan_without_modes_has_no_mode_writes() {
+      compare(Model.callModeSequence({ muted: false }), [])
+    }
+
     function test_a_camera_that_needed_nothing_needs_nothing_undone() {
       // Lens open, already tracking, mic on — the state a regular user is in when a
       // second call starts. Both halves have to be empty, or the end of the call
