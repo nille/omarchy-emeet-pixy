@@ -559,8 +559,8 @@ matched on file contents rather than process name, so unrelated Python programs 
 - `scripts/pixy` — the helper CLI: V4L2 ioctls, vendor HID, preset and profile storage
 - `docs/PROTOCOL.md` — the wire protocol, what was verified against hardware, and why several of the
   camera's features are unused
-- `tests/test_pixy.py` — 396 unit tests over the helper
-- `tests/qml/` — 264 QML tests: input routing, cursor arithmetic, and the `Model.js` functions that
+- `tests/test_pixy.py` — 405 unit tests over the helper
+- `tests/qml/` — 299 QML tests: input routing, cursor arithmetic, and the `Model.js` functions that
   need a JS engine rather than Python — including each tab's row order, which tabs a given camera
   earns, and the call automation's restore round trip
 - `tests/harness/shell.qml` — standalone window for developing the panel without a running Omarchy

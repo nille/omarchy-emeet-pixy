@@ -65,9 +65,10 @@ anything for a capture device would want it.
 > Some settings — the mirror, flip and autofocus options on the SETTINGS tab — live in the camera's
 > firmware and persist across reboots by design, which the README says plainly.
 >
-> MIT. 660 tests: 396 Python (`python3 -m unittest discover -s tests`) and 264 QML
-> (`QT_QPA_PLATFORM=offscreen qmltestrunner -input tests/qml`). `omarchy plugin validate .` is clean
-> on the `v1.0.0` tag.
+> MIT. 704 tests: 405 Python (`python3 -m unittest discover -s tests`) and 299 QML
+> (`QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -input tests/qml`), both run in GitHub
+> Actions on every pull request and every push to `main`. `omarchy plugin validate .` is clean on the
+> `v1.1.0` tag.
 
 ## Checklist
 
